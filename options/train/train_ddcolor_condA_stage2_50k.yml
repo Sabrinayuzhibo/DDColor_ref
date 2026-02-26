@@ -1,0 +1,190 @@
+# general settings
+name: train_ddcolor_condA_ms_tokens_stage2_50k
+model_type: ColorModel
+scale: 1
+num_gpu: 1
+manual_seed: 0
+queue_size: 64
+
+# dataset and data loader settings
+datasets:
+  train:
+    name: ImageNet
+    type: LabDataset
+    dataroot_gt: /
+    meta_info_file: ['data_list/paint_mix_train.txt']
+    io_backend:
+      type: disk
+
+    gt_size: 256
+
+    # augmentation config
+    use_hflip: True
+    use_rot: False
+
+    # cutmix / fmix
+    do_cutmix: False
+    cutmix_p: 0.5
+    do_fmix: False
+    fmix_p: 0.5
+
+    # conditional reference tokens (route A: ref=GT)
+    cond_enable: true
+    cond_num_regions: 6
+    cond_mask_mode: ab_angle
+
+    # data loader
+    use_shuffle: true
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    dataset_enlarge_ratio: 1
+    pin_memory: false
+    persistent_workers: false
+    prefetch_mode: ~
+
+  val:
+    name: PaintMixVal
+    type: LabDataset
+    dataroot_gt: /
+    meta_info_file: ['data_list/paint_mix_train_val_small.txt']
+    io_backend:
+      type: disk
+
+    gt_size: 256
+
+    # no augmentation in val
+    use_hflip: False
+    use_rot: False
+
+    do_cutmix: False
+    cutmix_p: 0.0
+    do_fmix: False
+    fmix_p: 0.0
+
+    # conditional reference tokens (route A: ref=GT)
+    cond_enable: true
+    cond_num_regions: 6
+    cond_mask_mode: ab_angle
+
+    # data loader
+    use_shuffle: false
+    num_worker_per_gpu: 0
+    batch_size_per_gpu: 1
+    dataset_enlarge_ratio: 1
+    pin_memory: false
+    persistent_workers: false
+    prefetch_mode: ~
+
+# network structures
+network_g:
+  type: DDColor
+  encoder_name: convnext-l
+  encoder_from_pretrain: False
+
+  decoder_name: MultiScaleColorDecoder
+  num_queries: 256
+  num_scales: 3
+  dec_layers: 9
+
+  last_norm: Spectral
+  num_output_channels: 2
+  do_normalize: False
+
+network_d:
+  type: DynamicUNetDiscriminator
+  nf: 64
+  n_channels: 3
+
+# path
+path:
+  pretrain_network_g: experiments/train_ddcolor_condA_ms_tokens/models/net_g_latest.pth
+  pretrain_network_d: experiments/train_ddcolor_condA_ms_tokens/models/net_d_latest.pth
+  strict_load_g: true
+  strict_load_d: true
+  resume_state: ~
+
+# training settings
+train:
+  # enable conditional tokens
+  cond_opt:
+    enable: true
+    num_scales: 3
+    hidden_dim: 256
+    include_area_frac: true
+    freeze_ref_encoder: true
+
+  color_enhance: True
+  color_enhance_factor: 1.15
+
+  optim_g:
+    type: AdamW
+    lr: !!float 5e-5
+    weight_decay: 0.01
+    betas: [0.9, 0.99]
+  optim_d:
+    type: Adam
+    lr: !!float 5e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [30000, 42000]
+    gamma: 0.5
+
+  total_iter: 50000
+  warmup_iter: -1
+
+  # losses
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 0.1
+    reduction: mean
+  perceptual_opt:
+    type: PerceptualLoss
+    layer_weights:
+      'conv1_1': 0.0625
+      'conv2_1': 0.125
+      'conv3_1': 0.25
+      'conv4_1': 0.5
+      'conv5_1': 1.0
+    vgg_type: vgg16_bn
+    use_input_norm: true
+    range_norm: false
+    perceptual_weight: 1.0
+    style_weight: 0
+    criterion: l1
+  gan_opt:
+    type: GANLoss
+    gan_type: vanilla
+    real_label_val: 1.0
+    fake_label_val: 0.0
+    loss_weight: 0.8
+  colorfulness_opt:
+    type: ColorfulnessLoss
+    loss_weight: 0.05
+
+val:
+  val_freq: !!float 2000
+  save_img: true
+  pbar: false
+  suffix: ~
+  metrics: ~
+
+# logging settings
+logger:
+  print_freq: 50
+  save_snapshot_freq: !!float 2000
+  save_snapshot_verbose: True
+  save_checkpoint_freq: !!float 5000
+  use_tb_logger: true
+  wandb:
+    project: ~
+    resume_id: ~
+
+# dist training settings
+dist_params:
+  backend: nccl
+  port: 29500
+
+find_unused_parameters: true
