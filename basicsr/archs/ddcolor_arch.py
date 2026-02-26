@@ -24,6 +24,8 @@ class DDColor(nn.Module):
                  num_queries=256,
                  num_scales=3,
                  dec_layers=9,
+                 use_cond_gate=False,
+                 cond_gate_init=0.0,
                  encoder_from_pretrain=False):
         super().__init__()
 
@@ -41,6 +43,8 @@ class DDColor(nn.Module):
             num_queries=num_queries,
             num_scales=num_scales,
             dec_layers=dec_layers,
+            use_cond_gate=use_cond_gate,
+            cond_gate_init=cond_gate_init,
             decoder_name=decoder_name
         )
         self.refine_net = nn.Sequential(custom_conv_layer(num_queries + 3, num_output_channels, ks=1, use_activ=False, norm_type=NormType.Spectral))
@@ -55,12 +59,15 @@ class DDColor(nn.Module):
     def denormalize(self, img):
         return img * self.std + self.mean
 
-    def forward(self, x):
+    def forward(self, x, cond_tokens_per_scale=None, cond_pos_per_scale=None):
         if x.shape[1] == 3:
             x = self.normalize(x)
         
         self.encoder(x)
-        out_feat = self.decoder()
+        out_feat = self.decoder(
+            cond_tokens_per_scale=cond_tokens_per_scale,
+            cond_pos_per_scale=cond_pos_per_scale,
+        )
         coarse_input = torch.cat([out_feat, x], dim=1)
         out = self.refine_net(coarse_input)
 
@@ -79,6 +86,8 @@ class Decoder(nn.Module):
                  num_queries=256,
                  num_scales=3,
                  dec_layers=9,
+                 use_cond_gate=False,
+                 cond_gate_init=0.0,
                  decoder_name='MultiScaleColorDecoder'):
         super().__init__()
         self.hooks = hooks
@@ -98,6 +107,8 @@ class Decoder(nn.Module):
                 num_queries=num_queries,
                 num_scales=num_scales,
                 dec_layers=dec_layers,
+                use_cond_gate=use_cond_gate,
+                cond_gate_init=cond_gate_init,
             )
         else:
             self.color_decoder = SingleColorDecoder(
@@ -106,7 +117,7 @@ class Decoder(nn.Module):
             )
 
 
-    def forward(self):
+    def forward(self, cond_tokens_per_scale=None, cond_pos_per_scale=None):
         encode_feat = self.hooks[-1].feature
         out0 = self.layers[0](encode_feat)
         out1 = self.layers[1](out0) 
@@ -114,7 +125,12 @@ class Decoder(nn.Module):
         out3 = self.last_shuf(out2) 
 
         if self.decoder_name == 'MultiScaleColorDecoder':
-            out = self.color_decoder([out0, out1, out2], out3)
+            out = self.color_decoder(
+                [out0, out1, out2],
+                out3,
+                cond_tokens_per_scale=cond_tokens_per_scale,
+                cond_pos_per_scale=cond_pos_per_scale,
+            )
         else:
             out = self.color_decoder(out3, encode_feat)
            
@@ -216,7 +232,9 @@ class MultiScaleColorDecoder(nn.Module):
         pre_norm=False,
         color_embed_dim=256,
         enforce_input_project=True,
-        num_scales=3
+        num_scales=3,
+        use_cond_gate=False,
+        cond_gate_init=0.0,
     ):
         super().__init__()
 
@@ -228,7 +246,10 @@ class MultiScaleColorDecoder(nn.Module):
         self.num_heads = nheads
         self.num_layers = dec_layers
         self.transformer_self_attention_layers = nn.ModuleList()
+        # image cross-attn（对编码器图像特征）
         self.transformer_cross_attention_layers = nn.ModuleList()
+        # 额外的 cond cross-attn（对参考条件 tokens）
+        self.transformer_cond_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
         for _ in range(self.num_layers):
@@ -241,6 +262,14 @@ class MultiScaleColorDecoder(nn.Module):
                 )
             )
             self.transformer_cross_attention_layers.append(
+                CrossAttentionLayer(
+                    d_model=hidden_dim,
+                    nhead=nheads,
+                    dropout=0.0,
+                    normalize_before=pre_norm,
+                )
+            )
+            self.transformer_cond_cross_attention_layers.append(
                 CrossAttentionLayer(
                     d_model=hidden_dim,
                     nhead=nheads,
@@ -269,6 +298,16 @@ class MultiScaleColorDecoder(nn.Module):
         self.num_feature_levels = num_scales
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
 
+        # 条件 cross-attn 的可选 gate（按尺度设置，而非按层）
+        # 理由：同一尺度的 cond token 应该使用相同的 gate，更符合语义
+        self.use_cond_gate = use_cond_gate
+        if self.use_cond_gate:
+            init = float(cond_gate_init)
+            # 改为按尺度设置：num_feature_levels 个 gate（通常是 3）
+            self.cond_gate_logit = nn.Parameter(torch.full((self.num_feature_levels,), init))
+        else:
+            self.register_parameter('cond_gate_logit', None)
+
         # input projections
         self.input_proj = nn.ModuleList()
         for i in range(self.num_feature_levels):
@@ -283,7 +322,7 @@ class MultiScaleColorDecoder(nn.Module):
         # output FFNs
         self.color_embed = MLP(hidden_dim, hidden_dim, color_embed_dim, 3)
 
-    def forward(self, x, img_features):
+    def forward(self, x, img_features, cond_tokens_per_scale=None, cond_pos_per_scale=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -305,12 +344,38 @@ class MultiScaleColorDecoder(nn.Module):
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
-            # attention: cross-attention first
+            # 1) 先对当前尺度的条件 tokens 做 cross-attn（若提供）
+            if cond_tokens_per_scale is not None:
+                assert isinstance(cond_tokens_per_scale, (list, tuple))
+                cond_tokens = cond_tokens_per_scale[level_index]
+                cond_pos = None
+                if cond_pos_per_scale is not None:
+                    cond_pos = cond_pos_per_scale[level_index]
+
+                gate = None
+                if self.use_cond_gate and self.cond_gate_logit is not None:
+                    # 按尺度取 gate：同一尺度的 cond token 使用相同的 gate
+                    # 标量 gate，形状 (1,)，广播到 (S, N, C)
+                    gate = torch.sigmoid(self.cond_gate_logit[level_index]).view(1, 1, 1)
+
+                output = self.transformer_cond_cross_attention_layers[i](
+                    output,
+                    cond_tokens,
+                    memory_mask=None,
+                    memory_key_padding_mask=None,
+                    pos=cond_pos,
+                    query_pos=query_embed,
+                    gate=gate,
+                )
+
+            # 2) 再对图像多尺度特征做原始 cross-attn
             output = self.transformer_cross_attention_layers[i](
-                output, src[level_index],
+                output,
+                src[level_index],
                 memory_mask=None,
                 memory_key_padding_mask=None,
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index],
+                query_pos=query_embed,
             )
             output = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
