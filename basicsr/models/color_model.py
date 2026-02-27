@@ -185,14 +185,13 @@ class ColorModel(BaseModel):
         #         logger.warning(f'Params {k} will not be optimized.')
 
         # 只训练 conditioner：优化器中只包含 net_c 的参数
+        optim_params_g = self.net_g.parameters()
         if getattr(self, 'train_only_cond', False):
             if not (self.cond_enable and self.net_c is not None):
                 raise ValueError("train_only_cond=True 但未启用 cond_opt / net_c 为空，请检查配置。")
             optim_params_g = self.net_c.parameters()
         elif self.cond_enable and self.net_c is not None:
             optim_params_g = itertools.chain(self.net_g.parameters(), self.net_c.parameters())
-        else:
-        optim_params_g = self.net_g.parameters()
 
         # optimizer g
         optim_type = train_opt['optim_g'].pop('type')
