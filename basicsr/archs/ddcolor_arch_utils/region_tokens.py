@@ -128,6 +128,10 @@ class MultiScaleGridTokenConditioner(nn.Module):
             nn.init.kaiming_uniform_(conv.weight, a=1.0)
             if conv.bias is not None:
                 nn.init.constant_(conv.bias, 0.0)
+            # Ensure the projection layers live on the same device as the reference
+            # features, otherwise we will hit mismatched tensor / weight devices
+            # when the model runs on CUDA.
+            conv = conv.to(device=ref_feats[k].device)
             projs.append(conv)
         self.input_proj = nn.ModuleList(projs)
 
@@ -249,14 +253,12 @@ class MultiScaleDenseTokenConditioner(nn.Module):
         self,
         ref_feats: List[Tensor],
         masks: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[List[Tensor], List[Tensor]]:
         # 当前 dense/grid 模式不依赖人脸/语义掩码，忽略 masks。
         cond_tokens_per_scale, cond_pos_per_scale = self.grid_conditioner(ref_feats)
-
-        # 在序列维拼接，兼容原来的 (S, B, C) 接口
-        cond_tokens = torch.cat(cond_tokens_per_scale, dim=0)
-        cond_pos = torch.cat(cond_pos_per_scale, dim=0)
-        return cond_tokens, cond_pos
+        # 直接返回按尺度拆分的列表形式，方便与 MultiScaleColorDecoder
+        # 的多尺度 cross-attn 接口对接。
+        return cond_tokens_per_scale, cond_pos_per_scale
 
 
 class MultiScaleRegionTokenConditioner(nn.Module):

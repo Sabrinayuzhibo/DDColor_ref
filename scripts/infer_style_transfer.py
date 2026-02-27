@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Reference-guided style transfer inference for DDColor cond-B.
+r"""Reference-guided style transfer inference for DDColor cond-B.
 
 Output arrangement per sample:
   - result image
@@ -22,6 +22,7 @@ Examples:
 """
 
 import argparse
+import hashlib
 import math
 import os
 import sys
@@ -41,6 +42,28 @@ from ddcolor import DDColor, build_ddcolor_model
 from basicsr.archs.ddcolor_arch_utils.region_tokens import MultiScaleRegionTokenConditioner, MultiScaleDenseTokenConditioner, RegionTokenSpec
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def _safe_name(name: str) -> str:
+    """Make a filename-safe stem (Windows-friendly)."""
+    bad = '<>:"/\\|?*'
+    out = ''.join('_' if c in bad else c for c in name)
+    out = out.strip().rstrip('.')
+    return out if out else "unnamed"
+
+
+def _hash8(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+
+
+def _unique_key_for_path(p: Path, used: set) -> str:
+    """Create a stable, collision-free key from a file path."""
+    base = _safe_name(p.stem)
+    key = base
+    if key in used:
+        key = f"{base}__{_hash8(str(p.resolve()))}"
+    used.add(key)
+    return key
 
 
 class _MODNetONNXMatte:
@@ -451,7 +474,12 @@ def _build_cond_from_reference(model, conditioner, ref_bgr: np.ndarray, input_si
             masks = torch.from_numpy(masks_np).unsqueeze(0).to(device)  # (1,R,H,W)
             cond_tokens, cond_pos = conditioner(ref_feats, masks)
         if cond_gain != 1.0:
-            cond_tokens = cond_tokens * float(cond_gain)
+            g = float(cond_gain)
+            # 兼容 list[Tensor] / Tensor 两种形式
+            if isinstance(cond_tokens, (list, tuple)):
+                cond_tokens = [t * g for t in cond_tokens]
+            else:
+                cond_tokens = cond_tokens * g
     return cond_tokens, cond_pos
 
 
@@ -477,6 +505,24 @@ def _infer_one(model, conditioner, content_bgr: np.ndarray, ref_bgr: np.ndarray,
     return out_img, content_gray_bgr
 
 
+def _write_modnet_cutouts(content_dir: Path, img_bgr: np.ndarray, matte: np.ndarray):
+    """Save MODNet matte and cutout visualizations under content_dir/mask/."""
+    mask_dir = content_dir / "mask"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+
+    m = np.clip(matte.astype(np.float32), 0.0, 1.0)
+    m_u8 = (m * 255.0).round().astype(np.uint8)
+    _safe_write(mask_dir / "matte.png", m_u8)
+
+    # Cutout (RGBA): alpha = matte
+    rgba = np.dstack([img_bgr, m_u8])
+    _safe_write(mask_dir / "content_cutout_rgba.png", rgba)
+
+    # Foreground on black (BGR)
+    fg = (img_bgr.astype(np.float32) * (m[:, :, None])).round().astype(np.uint8)
+    _safe_write(mask_dir / "content_foreground.png", fg)
+
+
 def _resolve_cond_ckpt_path(net_g_ckpt: str, cond_ckpt: str = None):
     if cond_ckpt:
         return cond_ckpt if os.path.isfile(cond_ckpt) else None
@@ -496,7 +542,16 @@ def _load_conditioner_weights(conditioner: torch.nn.Module, ckpt_path: str, devi
         state_dict = loaded['params']
     else:
         state_dict = loaded
-    conditioner.load_state_dict(state_dict, strict=True)
+    # Some checkpoints may contain extra keys (e.g. from newer conditioner variants).
+    # Use strict=False so that unexpected keys are safely ignored while required
+    # parameters are loaded when names match.
+    missing, unexpected = conditioner.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        print(f"[WARN] Ignoring unexpected conditioner keys: {list(unexpected)[:8]}..."
+              f" (total {len(unexpected)})")
+    if missing:
+        print(f"[WARN] Conditioner missing {len(missing)} keys from checkpoint; "
+              f"model may not exactly match training config.")
 
 
 def main():
@@ -505,17 +560,33 @@ def main():
     parser.add_argument("--content", required=True, type=str, help="Content image file/folder")
     parser.add_argument("--reference", required=True, type=str, help="Reference image file/folder")
     parser.add_argument("--output", default="results_condB", type=str)
+    parser.add_argument(
+        "--output_layout",
+        default="structured",
+        choices=["structured", "flat"],
+        help="structured: one folder per content + global ref_lowres; flat: old flat filenames",
+    )
     parser.add_argument("--input_size", default=512, type=int)
     parser.add_argument("--model_size", default="large", choices=["tiny", "large"])
     parser.add_argument("--num_queries", default=256, type=int)
     parser.add_argument("--num_scales", default=3, type=int)
     parser.add_argument("--dec_layers", default=9, type=int)
     parser.add_argument("--save_triptych", action="store_true", help="Save [content_gray|ref|result] panel")
-    parser.add_argument("--pair_mode", default="cycle", choices=["cycle", "same_name"], help="Folder pairing strategy")
+    parser.add_argument(
+        "--pair_mode",
+        default="all",
+        choices=["all", "cycle", "same_name"],
+        help="Folder pairing strategy when --reference is a folder. all=all refs per content (recommended).",
+    )
     parser.add_argument("--token_mode", default="dense", choices=["dense", "region"], help="Condition token mode")
     parser.add_argument("--mask_mode", default="portrait_heuristic", choices=["portrait_heuristic", "ab_angle"], help="Reference mask building mode (only for token_mode=region)")
     parser.add_argument("--cond_gain", default=1.0, type=float, help="Inference-time gain on reference condition tokens; >1 strengthens reference influence")
     parser.add_argument("--cond_ckpt", default=None, type=str, help="Optional conditioner checkpoint path (net_c_*.pth). If omitted, auto-resolve from --ckpt")
+    parser.add_argument(
+        "--allow_random_conditioner",
+        action="store_true",
+        help="Allow running without net_c checkpoint (will use randomly initialized conditioner; usually produces artifacts and ignores reference).",
+    )
     parser.add_argument("--region_color_transfer", action="store_true", help="Apply semantic region-wise color transfer post-process")
     parser.add_argument("--region_transfer_strength", default=0.85, type=float, help="Region color transfer strength")
     parser.add_argument("--region_transfer_min_area", default=0.005, type=float, help="Minimum area ratio for a region to be transferred")
@@ -530,6 +601,7 @@ def main():
     parser.add_argument("--modnet_gate_strength", default=1.0, type=float, help="Mask gating strength by MODNet matte in [0,1]")
     parser.add_argument("--modnet_matte_min", default=0.02, type=float, help="Minimum matte value to keep as foreground")
     parser.add_argument("--modnet_bg_preserve", default=0.0, type=float, help="Optional blend to preserve grayscale background using (1-matte)")
+    parser.add_argument("--ref_lowres_size", default=256, type=int, help="Global low-res reference image size (square)")
 
     args = parser.parse_args()
 
@@ -537,8 +609,6 @@ def main():
         raise SystemExit('Mask-based inference is disabled: only --token_mode dense is allowed.')
     if bool(args.region_color_transfer):
         raise SystemExit('Mask-based region color transfer is disabled for inference policy.')
-    if args.modnet_ckpt or args.modnet_onnx:
-        raise SystemExit('Mask-based MODNet matte inference is disabled for inference policy.')
     if args.mask_mode != 'ab_angle':
         print('[WARN] mask_mode is ignored in dense no-mask inference policy.')
 
@@ -574,7 +644,18 @@ def main():
         _load_conditioner_weights(conditioner, cond_ckpt_path, device)
         print(f"[INFO] Loaded conditioner weights: {cond_ckpt_path}")
     else:
-        print("[WARN] Conditioner checkpoint not found. Using randomly initialized conditioner for inference.")
+        msg = (
+            "[ERROR] Conditioner checkpoint (net_c_*.pth) not found. "
+            "Ref-guided inference requires net_c weights; otherwise the conditioner is random and reference has little/no effect.\n"
+            f"  - net_g ckpt: {args.ckpt}\n"
+            f"  - cond_ckpt (override): {args.cond_ckpt}\n"
+            "Expected auto-resolve: same folder, net_g_* -> net_c_*\n"
+            "If you *really* want to run with a random conditioner (not recommended), pass --allow_random_conditioner."
+        )
+        if args.allow_random_conditioner:
+            print(msg.replace("[ERROR]", "[WARN]"))
+        else:
+            raise SystemExit(msg)
     conditioner.eval()
 
     modnet = None
@@ -596,25 +677,81 @@ def main():
         raise SystemExit(f"No reference images found: {args.reference}")
 
     out_dir = Path(args.output)
-    trip_dir = out_dir / "triptych"
     out_dir.mkdir(parents=True, exist_ok=True)
     content_matte_cache = {}
     ref_matte_cache = {}
 
-    for idx, c_path in enumerate(content_list):
-        if Path(args.reference).is_file():
-            r_path = ref_list[0]
-        else:
-            if args.pair_mode == "same_name":
-                candidate = Path(args.reference) / c_path.name
-                r_path = candidate if candidate.exists() else ref_list[idx % len(ref_list)]
-            else:
-                r_path = ref_list[idx % len(ref_list)]
+    # Structured output: write all low-res refs once under out_dir/ref_lowres
+    output_layout = str(args.output_layout).lower()
+    ref_imgs_cache = {}
+    ref_key_used = set()
+    ref_key_by_path = {}
 
+    if output_layout == "structured":
+        ref_lowres_dir = out_dir / "ref_lowres"
+        ref_lowres_dir.mkdir(parents=True, exist_ok=True)
+        for r_path in ref_list:
+            r_key = _unique_key_for_path(Path(r_path), ref_key_used)
+            ref_key_by_path[str(r_path)] = r_key
+            r_img = cv2.imread(str(r_path))
+            if r_img is None:
+                print(f"[WARN] skip unreadable ref: {r_path}")
+                continue
+            ref_imgs_cache[str(r_path)] = r_img
+            lr = cv2.resize(r_img, (int(args.ref_lowres_size), int(args.ref_lowres_size)), interpolation=cv2.INTER_AREA)
+            _safe_write(ref_lowres_dir / f"{r_key}.png", lr)
+
+    content_key_used = set()
+
+    for idx, c_path in enumerate(content_list):
         c_img = cv2.imread(str(c_path))
+        if c_img is None:
+            print(f"[WARN] skip unreadable content: {c_path}")
+            continue
+
+        # Determine which reference(s) to run
+        selected_refs = []
+        if Path(args.reference).is_file():
+            selected_refs = [ref_list[0]]
+        else:
+            if args.pair_mode == "all":
+                selected_refs = list(ref_list)
+            elif args.pair_mode == "same_name":
+                candidate = Path(args.reference) / c_path.name
+                selected_refs = [candidate] if candidate.exists() else [ref_list[idx % len(ref_list)]]
+            else:  # cycle
+                selected_refs = [ref_list[idx % len(ref_list)]]
+
+        if output_layout == "structured":
+            content_key = _unique_key_for_path(Path(c_path), content_key_used)
+            c_dir = out_dir / content_key
+            outputs_dir = c_dir / "outputs"
+            trip_dir = c_dir / "triptych"
+            c_dir.mkdir(parents=True, exist_ok=True)
+            outputs_dir.mkdir(parents=True, exist_ok=True)
+            if args.save_triptych:
+                trip_dir.mkdir(parents=True, exist_ok=True)
+
+            _safe_write(c_dir / "content_original.png", c_img)
+            # Save grayscale input (helpful for debugging / downstream)
+            _, content_gray_bgr_dbg = _to_gray_rgb_tensor(c_img, args.input_size, device)
+            content_gray_bgr_dbg = cv2.cvtColor((content_gray_bgr_dbg * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR)
+            _safe_write(c_dir / "content_gray.png", content_gray_bgr_dbg)
+
+            # If MODNet enabled, save cutouts once per content
+            if modnet is not None:
+                c_key = str(c_path)
+                if c_key not in content_matte_cache:
+                    content_matte_cache[c_key] = modnet.predict_matte(c_img)
+                _write_modnet_cutouts(c_dir, c_img, content_matte_cache[c_key])
+
+        for r_path in selected_refs:
+            # Load reference image (prefer cached low-res dict if available)
+            r_img = ref_imgs_cache.get(str(r_path))
+            if r_img is None:
         r_img = cv2.imread(str(r_path))
-        if c_img is None or r_img is None:
-            print(f"[WARN] skip unreadable pair: {c_path} | {r_path}")
+            if r_img is None:
+                print(f"[WARN] skip unreadable ref: {r_path}")
             continue
 
         out_img, content_gray_bgr = _infer_one(
@@ -629,45 +766,15 @@ def main():
             cond_gain=args.cond_gain,
         )
 
+            # Optional MODNet-based background preservation
         content_matte = None
-        ref_matte = None
         if modnet is not None:
             c_key = str(c_path)
-            r_key = str(r_path)
             if c_key not in content_matte_cache:
                 content_matte_cache[c_key] = modnet.predict_matte(c_img)
-            if r_key not in ref_matte_cache:
-                ref_matte_cache[r_key] = modnet.predict_matte(r_img)
             content_matte = content_matte_cache[c_key]
-            ref_matte = ref_matte_cache[r_key]
 
-        if args.region_color_transfer:
-            ref_rgb = cv2.cvtColor(r_img, cv2.COLOR_BGR2RGB)
-            out_rgb = cv2.cvtColor(out_img, cv2.COLOR_BGR2RGB)
-            ref_masks = _build_masks_portrait_heuristic(ref_rgb, num_regions=6)
-            out_masks = _build_masks_portrait_heuristic(out_rgb, num_regions=6)
-            prof = _get_region_profile(args.region_profile)
-            out_img = _apply_region_color_transfer(
-                output_bgr=out_img,
-                ref_bgr=r_img,
-                out_masks=out_masks,
-                ref_masks=ref_masks,
-                strength=float(args.region_transfer_strength),
-                min_area_frac=float(args.region_transfer_min_area),
-                max_shift=float(args.region_transfer_max_shift),
-                include_regions=(0, 1, 2, 3),
-                mask_erode=int(args.region_transfer_mask_erode),
-                mask_blur=int(args.region_transfer_mask_blur),
-                region_weights=prof['region_weights'],
-                region_min_area=prof['region_min_area'],
-                region_max_shift=prof['region_max_shift'],
-                out_matte=content_matte,
-                ref_matte=ref_matte,
-                matte_gate_strength=float(args.modnet_gate_strength),
-                matte_min=float(args.modnet_matte_min),
-            )
-
-        if modnet is not None and float(args.modnet_bg_preserve) > 0:
+                if float(args.modnet_bg_preserve) > 0 and content_matte is not None:
             alpha = np.clip(content_matte, 0.0, 1.0)[:, :, None].astype(np.float32)
             preserve = float(np.clip(args.modnet_bg_preserve, 0.0, 1.0))
             bg_w = (1.0 - alpha) * preserve
@@ -675,12 +782,26 @@ def main():
             gray_f = content_gray_bgr.astype(np.float32)
             out_img = np.clip(out_f * (1.0 - bg_w) + gray_f * bg_w, 0, 255).astype(np.uint8)
 
+            if output_layout == "structured":
+                r_key = ref_key_by_path.get(str(r_path))
+                if r_key is None:
+                    # For single-ref file case where we didn't pre-build keys
+                    r_key = _safe_name(Path(r_path).stem)
+                _safe_write(outputs_dir / f"{r_key}.png", out_img)
+
+                if args.save_triptych:
+                    ref_resized = cv2.resize(r_img, (c_img.shape[1], c_img.shape[0]))
+                    panel = np.concatenate([content_gray_bgr, ref_resized, out_img], axis=1)
+                    _safe_write(trip_dir / f"{r_key}.png", panel)
+            else:
         stem = c_path.stem
         suffix = c_path.suffix if c_path.suffix else ".png"
-        out_name = f"{stem}__ref_{r_path.stem}{suffix}"
+                out_name = f"{stem}__ref_{Path(r_path).stem}{suffix}"
         _safe_write(out_dir / out_name, out_img)
 
         if args.save_triptych:
+                    trip_dir = out_dir / "triptych"
+                    trip_dir.mkdir(parents=True, exist_ok=True)
             ref_resized = cv2.resize(r_img, (c_img.shape[1], c_img.shape[0]))
             panel = np.concatenate([content_gray_bgr, ref_resized, out_img], axis=1)
             _safe_write(trip_dir / out_name, panel)

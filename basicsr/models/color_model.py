@@ -1,11 +1,13 @@
 import os
 import torch
+import itertools
 from collections import OrderedDict
 from os import path as osp
 from tqdm import tqdm
 import numpy as np
 
 from basicsr.archs import build_network
+from basicsr.archs.ddcolor_arch_utils.region_tokens import MultiScaleDenseTokenConditioner, MultiScaleRegionTokenConditioner, RegionTokenSpec
 from basicsr.losses import build_loss
 from basicsr.metrics import calculate_metric
 from basicsr.utils import get_root_logger, imwrite, tensor2img
@@ -13,8 +15,22 @@ from basicsr.utils.img_util import tensor_lab2rgb
 from basicsr.utils.dist_util import master_only
 from basicsr.utils.registry import MODEL_REGISTRY
 from .base_model import BaseModel
-from basicsr.metrics.custom_fid import INCEPTION_V3_FID, get_activations, calculate_activation_statistics, calculate_frechet_distance
 from basicsr.utils.color_enhance import color_enhacne_blend
+
+# Optional dependency: `custom_fid` requires SciPy. Make it lazy/optional so training
+# without FID metrics can still run in minimal environments.
+try:
+    from basicsr.metrics.custom_fid import (
+        INCEPTION_V3_FID,
+        get_activations,
+        calculate_activation_statistics,
+        calculate_frechet_distance,
+    )
+except Exception:  # pragma: no cover
+    INCEPTION_V3_FID = None
+    get_activations = None
+    calculate_activation_statistics = None
+    calculate_frechet_distance = None
 
 
 @MODEL_REGISTRY.register()
@@ -28,12 +44,58 @@ class ColorModel(BaseModel):
         self.net_g = build_network(opt['network_g'])
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
+
+        # Finetune 模式：只训练 conditioner（net_c），冻结主干生成器 net_g 的参数
+        # 通过 options/train/*.yml 中 train.train_only_cond: true 控制
+        self.train_only_cond = bool(self.opt.get('train', {}).get('train_only_cond', False)) if self.opt.get('is_train', False) else False
+
+        # Optional reference conditioner net_c (DDColor cond-B)
+        self.cond_enable = bool(self.opt.get('train', {}).get('cond_opt', {}).get('enable', False)) if self.opt.get('is_train', False) else False
+        self.net_c = None
+        if self.cond_enable:
+            cond_opt = self.opt.get('train', {}).get('cond_opt', {})
+            token_mode = str(cond_opt.get('token_mode', 'dense')).lower()
+            num_scales = int(cond_opt.get('num_scales', 3))
+            hidden_dim = int(cond_opt.get('hidden_dim', 256))
+            grid_size = int(cond_opt.get('grid_size', 16))
+            include_area_frac = bool(cond_opt.get('include_area_frac', True))
+
+            if token_mode in ('dense', 'grid'):
+                self.net_c = MultiScaleDenseTokenConditioner(
+                    num_scales=num_scales,
+                    hidden_dim=hidden_dim,
+                    grid_size=grid_size,
+                )
+            elif token_mode in ('region', 'mask'):
+                self.net_c = MultiScaleRegionTokenConditioner(
+                    spec=RegionTokenSpec(),
+                    num_scales=num_scales,
+                    hidden_dim=hidden_dim,
+                    include_area_frac=include_area_frac,
+                )
+            else:
+                raise ValueError(f"Unknown cond_opt.token_mode={token_mode!r}")
+
+            self.net_c = self.model_to_device(self.net_c)
+            self.print_network(self.net_c)
+
+        # 如果只想训练 conditioner，则先冻结 net_g 参数
+        if self.is_train and self.train_only_cond:
+            for p in self.net_g.parameters():
+                p.requires_grad = False
         
         # load pretrained model for net_g
         load_path = self.opt['path'].get('pretrain_network_g', None)
         if load_path is not None:
             param_key = self.opt['path'].get('param_key_g', 'params')
             self.load_network(self.net_g, load_path, self.opt['path'].get('strict_load_g', True), param_key)
+
+        # load pretrained model for net_c (optional)
+        if self.cond_enable and self.net_c is not None:
+            load_path_c = self.opt['path'].get('pretrain_network_c', None)
+            if load_path_c is not None:
+                param_key_c = self.opt['path'].get('param_key_c', 'params')
+                self.load_network(self.net_c, load_path_c, self.opt['path'].get('strict_load_c', True), param_key_c)
 
         if self.is_train:
             self.init_training_settings()
@@ -70,6 +132,8 @@ class ColorModel(BaseModel):
 
         self.net_g.train()
         self.net_d.train()
+        if self.cond_enable and self.net_c is not None:
+            self.net_c.train()
 
         # define losses
         if train_opt.get('pixel_opt'):
@@ -81,6 +145,12 @@ class ColorModel(BaseModel):
             self.cri_perceptual = build_loss(train_opt['perceptual_opt']).to(self.device)
         else:
             self.cri_perceptual = None
+
+        # Reference style/perceptual loss (output vs reference image)
+        if train_opt.get('ref_style_opt'):
+            self.cri_ref_style = build_loss(train_opt['ref_style_opt']).to(self.device)
+        else:
+            self.cri_ref_style = None
 
         if train_opt.get('gan_opt'):
             self.cri_gan = build_loss(train_opt['gan_opt']).to(self.device)
@@ -113,6 +183,15 @@ class ColorModel(BaseModel):
         #     else:
         #         logger = get_root_logger()
         #         logger.warning(f'Params {k} will not be optimized.')
+
+        # 只训练 conditioner：优化器中只包含 net_c 的参数
+        if getattr(self, 'train_only_cond', False):
+            if not (self.cond_enable and self.net_c is not None):
+                raise ValueError("train_only_cond=True 但未启用 cond_opt / net_c 为空，请检查配置。")
+            optim_params_g = self.net_c.parameters()
+        elif self.cond_enable and self.net_c is not None:
+            optim_params_g = itertools.chain(self.net_g.parameters(), self.net_c.parameters())
+        else:
         optim_params_g = self.net_g.parameters()
 
         # optimizer g
@@ -133,17 +212,50 @@ class ColorModel(BaseModel):
             self.gt_lab = torch.cat([self.lq, self.gt], dim=1)
             self.gt_rgb = tensor_lab2rgb(self.gt_lab)
 
+            # optional reference image (RGB, [0,1])
+            self.ref_rgb = data.get('ref_rgb', None)
+            if self.ref_rgb is not None:
+                self.ref_rgb = self.ref_rgb.to(self.device)
+            self.ref_path = data.get('ref_path', None)
+
             if self.opt['train'].get('color_enhance', False):
                 for i in range(self.gt_rgb.shape[0]):
                     self.gt_rgb[i] = color_enhacne_blend(self.gt_rgb[i], factor=self.opt['train'].get('color_enhance_factor'))
 
     def optimize_parameters(self, current_iter):
+        train_opt = self.opt['train']
         # optimize net_g
         for p in self.net_d.parameters():
             p.requires_grad = False
         self.optimizer_g.zero_grad()
         
-        self.output_ab = self.net_g(self.lq_rgb)
+        cond_tokens_per_scale = None
+        cond_pos_per_scale = None
+        if self.cond_enable and self.net_c is not None and getattr(self, 'ref_rgb', None) is not None:
+            cond_opt = self.opt['train'].get('cond_opt', {})
+            freeze_ref_encoder = bool(cond_opt.get('freeze_ref_encoder', False))
+            cond_gain = float(cond_opt.get('gain', 1.0))
+
+            # Build conditioning tokens from reference features.
+            # NOTE: This runs the encoder on the reference once, then runs the full net_g forward on content.
+            # It is fine because we store ref_feats tensors immediately.
+            ref_in = self.net_g.normalize(self.ref_rgb) if hasattr(self.net_g, 'normalize') else self.ref_rgb
+            if freeze_ref_encoder:
+                with torch.no_grad():
+                    _ = self.net_g.encoder(ref_in)
+                    hooks = self.net_g.encoder.hooks
+                    ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+            else:
+                _ = self.net_g.encoder(ref_in)
+                hooks = self.net_g.encoder.hooks
+                ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+
+            cond_tokens_per_scale, cond_pos_per_scale = self.net_c(ref_feats)
+            if cond_gain != 1.0 and cond_tokens_per_scale is not None:
+                cond_tokens_per_scale = [t * cond_gain for t in cond_tokens_per_scale]
+        
+        # Forward with optional conditioning (DDColor supports cond_tokens/cond_pos aliases)
+        self.output_ab = self.net_g(self.lq_rgb, cond_tokens=cond_tokens_per_scale, cond_pos=cond_pos_per_scale)
         self.output_lab = torch.cat([self.lq, self.output_ab], dim=1)
         self.output_rgb = tensor_lab2rgb(self.output_lab)
 
@@ -164,6 +276,33 @@ class ColorModel(BaseModel):
             if l_g_style is not None:
                 l_g_total += l_g_style
                 loss_dict['l_g_style'] = l_g_style
+
+        # reference style loss (output vs reference)
+        if self.cri_ref_style and getattr(self, 'ref_rgb', None) is not None:
+            l_r_percep, l_r_style = self.cri_ref_style(self.output_rgb, self.ref_rgb)
+            if l_r_percep is not None:
+                l_g_total += l_r_percep
+                loss_dict['l_ref_percep'] = l_r_percep
+            if l_r_style is not None:
+                l_g_total += l_r_style
+                loss_dict['l_ref_style'] = l_r_style
+
+        # optional: push cond gate to open a bit (avoid "reference has no effect")
+        gate_push_opt = train_opt.get('cond_gate_push_opt', None)
+        if gate_push_opt and gate_push_opt.get('enable', False):
+            try:
+                w = float(gate_push_opt.get('loss_weight', 0.0))
+                tgt = float(gate_push_opt.get('target_sigmoid', 0.45))
+                if w > 0:
+                    gate_logit = self.net_g.decoder.color_decoder.cond_gate_logit
+                    if gate_logit is not None:
+                        gate = torch.sigmoid(gate_logit)
+                        l_gate = (gate - tgt).pow(2).mean() * w
+                        l_g_total += l_gate
+                        loss_dict['l_cond_gate_push'] = l_gate
+            except Exception:
+                # keep training robust even if gate attr path changes
+                pass
         # gan loss
         if self.cri_gan:
             fake_g_pred = self.net_d(self.output_rgb)
@@ -343,6 +482,8 @@ class ColorModel(BaseModel):
                 tb_logger.add_scalar(f'metrics/{dataset_name}/{metric}', value, current_iter)
 
     def _prepare_inception_model_fid(self, path='pretrain/inception_v3_google-1a9a5a14.pth'):
+        if INCEPTION_V3_FID is None:
+            raise ImportError("FID metric requires optional dependencies (e.g. SciPy). Please `pip install scipy` to enable FID.")
         incep_state_dict = torch.load(path, map_location='cpu')
         block_idx = INCEPTION_V3_FID.BLOCK_INDEX_BY_DIM[2048]
         self.inception_model_fid = INCEPTION_V3_FID(incep_state_dict, [block_idx])
@@ -366,4 +507,6 @@ class ColorModel(BaseModel):
         else:
             self.save_network(self.net_g, 'net_g', current_iter)
         self.save_network(self.net_d, 'net_d', current_iter)
+        if self.cond_enable and self.net_c is not None:
+            self.save_network(self.net_c, 'net_c', current_iter)
         self.save_training_state(epoch, current_iter)

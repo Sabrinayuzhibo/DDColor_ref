@@ -59,7 +59,23 @@ class DDColor(nn.Module):
     def denormalize(self, img):
         return img * self.std + self.mean
 
-    def forward(self, x, cond_tokens_per_scale=None, cond_pos_per_scale=None):
+    def forward(
+        self,
+        x,
+        cond_tokens_per_scale=None,
+        cond_pos_per_scale=None,
+        # Backwards-compat keyword aliases used by `scripts/infer_style_transfer.py`
+        cond_tokens=None,
+        cond_pos=None,
+    ):
+        # Allow both the new `(cond_tokens_per_scale, cond_pos_per_scale)` API
+        # and the legacy `(cond_tokens, cond_pos)` names used in inference
+        # scripts. If the compact aliases are provided, they override.
+        if cond_tokens is not None:
+            cond_tokens_per_scale = cond_tokens
+        if cond_pos is not None:
+            cond_pos_per_scale = cond_pos
+
         if x.shape[1] == 3:
             x = self.normalize(x)
         

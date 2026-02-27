@@ -1,0 +1,13 @@
+content: results_train_ddcolor_condB_p1_dense_gated_refboost_20k_perf_addc400_bs4_noprefetch/New York Riverfront December 15, 1931.jpg
+ref1: assets/test_ref_images/23a244c3-d5ac-4fc2-b924-ba1b743108a5.jpg (key=23a244c3-d5ac-4fc2-b924-ba1b743108a5, gain=1.0)
+ref2: assets/test_ref_images/aff9b6d2-e168-4598-af54-d6b6c198be0f.jpg (key=aff9b6d2-e168-4598-af54-d6b6c198be0f, gain=1.0)
+
+=== per-scale stats ===
+scale_0: rms_diff=1.726185, norm_a=0.983486, norm_b=0.945628, avg_norm=0.964557
+scale_1: rms_diff=1.777924, norm_a=0.964123, norm_b=0.957177, avg_norm=0.960650
+scale_2: rms_diff=1.672843, norm_a=0.905827, norm_b=0.933861, avg_norm=0.919844
+
+=== summary ===
+两次条件 tokens 差异相对范数均值约 1.8197，非常大，可能导致风格/色彩分布强烈偏移。
+
+解释：若差异远小于范数，说明两张参考在条件空间中几乎重合；若差异与范数同量级甚至更大，说明参考风格/语义在条件空间中差异很大。

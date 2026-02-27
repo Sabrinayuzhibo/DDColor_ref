@@ -46,6 +46,20 @@ class LabDataset(data.Dataset):
         self.cutmix_params = {'alpha':1.}
         self.cutmix_p = opt['cutmix_p']
 
+        # Optional reference conditioning (for DDColor cond-B training).
+        # When enabled, the dataset returns an additional `ref_rgb` tensor in RGB [0,1].
+        self.cond_enable = bool(opt.get('cond_enable', False))
+        self.cond_ref_mode = str(opt.get('cond_ref_mode', 'random')).lower()  # random | self
+
+    def _load_rgb_float(self, path: str, gt_size: int):
+        """Load an image from path and return RGB float32 in [0,1] resized to (gt_size, gt_size)."""
+        # NOTE: Use the same file client as GT to support various backends.
+        img_bytes = self.file_client.get(path, 'gt')
+        img = imfrombytes(img_bytes, float32=True)  # BGR in [0,1]
+        img = cv2.resize(img, (gt_size, gt_size))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
+
 
     def __getitem__(self, index):
         if self.file_client is None:
@@ -103,7 +117,30 @@ class LabDataset(data.Dataset):
                 img_gt[:, bbx1:bbx2, bby1:bby2] = cmix_img[:, bbx1:bbx2, bby1:bby2]
 
 
-        # ----------------------------- Get gray lq, to tentor ----------------------------- #
+        # ----------------------------- Optional: pick reference image ----------------------------- #
+        ref_path = None
+        ref_rgb = None
+        if self.cond_enable:
+            if self.cond_ref_mode in ('self', 'same', 'target'):
+                ref_path = gt_path
+            else:
+                # random reference (avoid selecting itself when possible)
+                if len(self.paths) > 1:
+                    ridx = random.randint(0, self.__len__() - 1)
+                    if ridx == index:
+                        ridx = (ridx + 1) % self.__len__()
+                    ref_path = self.paths[ridx]
+                else:
+                    ref_path = gt_path
+            try:
+                ref_rgb = self._load_rgb_float(ref_path, gt_size)  # RGB [0,1]
+            except Exception as e:
+                logger = get_root_logger()
+                logger.warning(f'Failed to load reference image: {ref_path}, fallback to self. err={e}')
+                ref_path = gt_path
+                ref_rgb = cv2.cvtColor(img_gt, cv2.COLOR_BGR2RGB)
+
+        # ----------------------------- Get gray lq, to tensor ----------------------------- #
         # convert to gray
         img_gt = cv2.cvtColor(img_gt, cv2.COLOR_BGR2RGB)
         img_l, img_ab = rgb2lab(img_gt)
@@ -121,6 +158,11 @@ class LabDataset(data.Dataset):
             'lq_path': gt_path,
             'gt_path': gt_path
         }
+        if self.cond_enable:
+            # Keep ref in RGB [0,1] float32 tensor (C,H,W)
+            ref_rgb_t = img2tensor([ref_rgb], bgr2rgb=False, float32=True)[0]
+            return_d['ref_rgb'] = ref_rgb_t
+            return_d['ref_path'] = ref_path
         return return_d
 
     def ab2int(self, img_ab):
