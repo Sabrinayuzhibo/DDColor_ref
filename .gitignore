@@ -139,3 +139,8 @@ data_list/*.txt
 weights/
 
 results_*/*.txt
+
+# ignore per-sample comparison reports under any results folder
+results/**/condition_compare.txt
+results_*/**/condition_compare.txt
+

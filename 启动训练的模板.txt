@@ -1,0 +1,1 @@
+python -m basicsr.train -opt options/train/train_ddcolor_condB_p1_grid_posenc_20k_artist_decoder_cond.yml --launcher none

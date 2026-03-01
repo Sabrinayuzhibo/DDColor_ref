@@ -50,6 +50,16 @@ class ColorModel(BaseModel):
         self.train_only_cond = bool(self.opt.get('train', {}).get('train_only_cond', False)) if self.opt.get('is_train', False) else False
         # 方向B：冻结 encoder，只训练 decoder(+cond gate) 与 conditioner（net_c）
         self.train_decoder_cond = bool(self.opt.get('train', {}).get('train_decoder_cond', False)) if self.opt.get('is_train', False) else False
+        # 更细粒度：仅训练 color decoder(+cond gate) 与 conditioner（net_c），不训练 pixel decoder
+        self.train_color_decoder_cond = bool(self.opt.get('train', {}).get('train_color_decoder_cond', False)) if self.opt.get('is_train', False) else False
+
+        if self.is_train:
+            mode_flags = [self.train_only_cond, self.train_decoder_cond, self.train_color_decoder_cond]
+            if sum(bool(x) for x in mode_flags) > 1:
+                raise ValueError(
+                    'train_only_cond/train_decoder_cond/train_color_decoder_cond 互斥，'
+                    '请仅启用一个训练模式。'
+                )
 
         # Optional reference conditioner net_c (DDColor cond-B)
         self.cond_enable = bool(self.opt.get('train', {}).get('cond_opt', {}).get('enable', False)) if self.opt.get('is_train', False) else False
@@ -92,6 +102,17 @@ class ColorModel(BaseModel):
                 raise ValueError('train_decoder_cond=True 但 net_g.encoder 不存在，无法仅冻结 encoder。')
             for p in enc.parameters():
                 p.requires_grad = False
+        # 仅训练 color decoder（含 cond gate）；冻结 encoder + pixel decoder + refine
+        elif self.is_train and self.train_color_decoder_cond:
+            for p in self.net_g.parameters():
+                p.requires_grad = False
+
+            dec = getattr(self.net_g, 'decoder', None)
+            color_dec = getattr(dec, 'color_decoder', None) if dec is not None else None
+            if color_dec is None:
+                raise ValueError('train_color_decoder_cond=True 但 net_g.decoder.color_decoder 不存在。')
+            for p in color_dec.parameters():
+                p.requires_grad = True
         
         # load pretrained model for net_g
         load_path = self.opt['path'].get('pretrain_network_g', None)
