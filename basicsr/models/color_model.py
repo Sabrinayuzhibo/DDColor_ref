@@ -48,6 +48,8 @@ class ColorModel(BaseModel):
         # Finetune 模式：只训练 conditioner（net_c），冻结主干生成器 net_g 的参数
         # 通过 options/train/*.yml 中 train.train_only_cond: true 控制
         self.train_only_cond = bool(self.opt.get('train', {}).get('train_only_cond', False)) if self.opt.get('is_train', False) else False
+        # 方向B：冻结 encoder，只训练 decoder(+cond gate) 与 conditioner（net_c）
+        self.train_decoder_cond = bool(self.opt.get('train', {}).get('train_decoder_cond', False)) if self.opt.get('is_train', False) else False
 
         # Optional reference conditioner net_c (DDColor cond-B)
         self.cond_enable = bool(self.opt.get('train', {}).get('cond_opt', {}).get('enable', False)) if self.opt.get('is_train', False) else False
@@ -82,6 +84,13 @@ class ColorModel(BaseModel):
         # 如果只想训练 conditioner，则先冻结 net_g 参数
         if self.is_train and self.train_only_cond:
             for p in self.net_g.parameters():
+                p.requires_grad = False
+        # 方向B：冻结 encoder，只允许 decoder 分支学习
+        elif self.is_train and self.train_decoder_cond:
+            enc = getattr(self.net_g, 'encoder', None)
+            if enc is None:
+                raise ValueError('train_decoder_cond=True 但 net_g.encoder 不存在，无法仅冻结 encoder。')
+            for p in enc.parameters():
                 p.requires_grad = False
         
         # load pretrained model for net_g
@@ -176,22 +185,27 @@ class ColorModel(BaseModel):
 
     def setup_optimizers(self):
         train_opt = self.opt['train']
-        # optim_params_g = []
-        # for k, v in self.net_g.named_parameters():
-        #     if v.requires_grad:
-        #         optim_params_g.append(v)
-        #     else:
-        #         logger = get_root_logger()
-        #         logger.warning(f'Params {k} will not be optimized.')
-
         # 只训练 conditioner：优化器中只包含 net_c 的参数
-        optim_params_g = self.net_g.parameters()
+        optim_params_g = []
         if getattr(self, 'train_only_cond', False):
             if not (self.cond_enable and self.net_c is not None):
                 raise ValueError("train_only_cond=True 但未启用 cond_opt / net_c 为空，请检查配置。")
-            optim_params_g = self.net_c.parameters()
+            modules = [self.net_c]
         elif self.cond_enable and self.net_c is not None:
-            optim_params_g = itertools.chain(self.net_g.parameters(), self.net_c.parameters())
+            modules = [self.net_g, self.net_c]
+        else:
+            modules = [self.net_g]
+
+        for module in modules:
+            for name, param in module.named_parameters():
+                if param.requires_grad:
+                    optim_params_g.append(param)
+                else:
+                    logger = get_root_logger()
+                    logger.info(f'Params {name} are frozen and excluded from optimizer.')
+
+        if len(optim_params_g) == 0:
+            raise ValueError('No trainable parameters collected for optimizer_g. Please check freeze settings.')
 
         # optimizer g
         optim_type = train_opt['optim_g'].pop('type')
