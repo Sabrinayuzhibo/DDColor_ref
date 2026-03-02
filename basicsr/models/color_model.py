@@ -195,6 +195,23 @@ class ColorModel(BaseModel):
         else:
             self.cri_colorfulness = None
 
+        # Optional local AB loss: emphasize high-gradient local regions (e.g., hair/edges)
+        local_ab_opt = train_opt.get('local_ab_opt', None)
+        self.local_ab_opt = local_ab_opt if (local_ab_opt and local_ab_opt.get('enable', False)) else None
+        if self.local_ab_opt is not None:
+            loss_weight = float(self.local_ab_opt.get('loss_weight', 0.0))
+            reduction = str(self.local_ab_opt.get('reduction', 'mean'))
+            if loss_weight <= 0:
+                self.cri_local_ab = None
+            else:
+                self.cri_local_ab = build_loss({
+                    'type': 'L1Loss',
+                    'loss_weight': loss_weight,
+                    'reduction': reduction,
+                }).to(self.device)
+        else:
+            self.cri_local_ab = None
+
         # set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
@@ -256,6 +273,42 @@ class ColorModel(BaseModel):
                 for i in range(self.gt_rgb.shape[0]):
                     self.gt_rgb[i] = color_enhacne_blend(self.gt_rgb[i], factor=self.opt['train'].get('color_enhance_factor'))
 
+    def _build_local_ab_weight(self):
+        """Build per-pixel AB weights from L-channel gradients (no extra annotations required)."""
+        if self.local_ab_opt is None:
+            return None
+
+        focus_ratio = float(self.local_ab_opt.get('focus_ratio', 0.25))
+        boost = float(self.local_ab_opt.get('boost', 4.0))
+        edge_power = float(self.local_ab_opt.get('edge_power', 1.0))
+
+        l = self.lq
+        n, _, h, w = l.shape
+        eps = 1e-6
+
+        gh = torch.zeros_like(l)
+        gw = torch.zeros_like(l)
+        gh[:, :, 1:, :] = torch.abs(l[:, :, 1:, :] - l[:, :, :-1, :])
+        gw[:, :, :, 1:] = torch.abs(l[:, :, :, 1:] - l[:, :, :, :-1])
+        edge = gh + gw
+
+        if edge_power != 1.0:
+            edge = edge.pow(edge_power)
+
+        flat = edge.view(n, -1)
+        if 0.0 < focus_ratio < 1.0:
+            q = max(0.0, min(1.0, 1.0 - focus_ratio))
+            thr = torch.quantile(flat, q, dim=1, keepdim=True).view(n, 1, 1, 1)
+            local_mask = (edge >= thr).float()
+        else:
+            local_mask = torch.ones_like(edge)
+
+        edge_mean = edge.mean(dim=(2, 3), keepdim=True)
+        edge_norm = edge / (edge_mean + eps)
+        w_local = (1.0 + boost * local_mask) * edge_norm
+        w_local = w_local.repeat(1, 2, 1, 1)
+        return w_local
+
     def optimize_parameters(self, current_iter):
         train_opt = self.opt['train']
         # optimize net_g
@@ -300,6 +353,13 @@ class ColorModel(BaseModel):
             l_g_pix = self.cri_pix(self.output_ab, self.gt)
             l_g_total += l_g_pix
             loss_dict['l_g_pix'] = l_g_pix
+
+        if self.cri_local_ab is not None:
+            local_w = self._build_local_ab_weight()
+            if local_w is not None:
+                l_g_local_ab = self.cri_local_ab(self.output_ab, self.gt, weight=local_w)
+                l_g_total += l_g_local_ab
+                loss_dict['l_g_local_ab'] = l_g_local_ab
 
         # perceptual loss
         if self.cri_perceptual:
