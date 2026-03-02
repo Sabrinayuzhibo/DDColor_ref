@@ -1,7 +1,7 @@
-#! condB grid + pos enc: 20k train, ddcolor_artistic backbone
-#! 方向B：冻结 ConvNeXt encoder，仅训练 decoder + cond gate + conditioner(net_c)
+#! condB grid + pos enc: 20k train from scratch schedule (no resume), ddcolor_artistic backbone
+#! 方向B：冻结 ConvNeXt encoder，仅训练 color decoder(+cond gate) + conditioner(net_c)
 
-name: train_ddcolor_condB_p1_grid_posenc_20k_artist_color_decoder_cond_style15_local
+name: train_ddcolor_condB_p1_grid_posenc_20k_artist_color_decoder_cond_style15_local_guide_fromscratch
 model_type: ColorModel
 scale: 1
 num_gpu: 1
@@ -118,7 +118,6 @@ train:
     use_spatial_pos: true
     spatial_pos_type: learnable
     include_area_frac: true
-    # encoder 已冻结，这里也走 no_grad，减少显存与计算
     freeze_ref_encoder: true
 
   color_enhance: True
@@ -178,13 +177,11 @@ train:
     style_weight: 1.5
     criterion: l1
 
-  # No-mask reference strengthening: global color-moment alignment
   ref_moment_opt:
     enable: true
     loss_weight: 0.080
     use_std: true
 
-  # No-mask reference strengthening: in-batch contrastive reference preference
   ref_contrast_opt:
     enable: true
     loss_weight: 0.040
@@ -198,6 +195,13 @@ train:
     focus_ratio: 0.25
     boost: 4.0
     edge_power: 1.0
+
+  guide_opt:
+    enable: true
+    loss_weight: 0.030
+    reduction: mean
+    weights: [0.20, 0.35, 0.60]
+    gray_target_first: true
 
   gan_opt:
     type: GANLoss

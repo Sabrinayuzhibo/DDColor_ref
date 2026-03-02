@@ -67,6 +67,7 @@ class DDColor(nn.Module):
         # Backwards-compat keyword aliases used by `scripts/infer_style_transfer.py`
         cond_tokens=None,
         cond_pos=None,
+        return_guides=False,
     ):
         # Allow both the new `(cond_tokens_per_scale, cond_pos_per_scale)` API
         # and the legacy `(cond_tokens, cond_pos)` names used in inference
@@ -80,15 +81,22 @@ class DDColor(nn.Module):
             x = self.normalize(x)
         
         self.encoder(x)
-        out_feat = self.decoder(
+        dec_out = self.decoder(
             cond_tokens_per_scale=cond_tokens_per_scale,
             cond_pos_per_scale=cond_pos_per_scale,
+            return_guides=return_guides,
         )
+        if return_guides:
+            out_feat, guide_preds = dec_out
+        else:
+            out_feat = dec_out
         coarse_input = torch.cat([out_feat, x], dim=1)
         out = self.refine_net(coarse_input)
 
         if self.do_normalize:
             out = self.denormalize(out)
+        if return_guides:
+            return out, guide_preds
         return out
 
 
@@ -116,6 +124,13 @@ class Decoder(nn.Module):
         embed_dim = nf // 2
 
         self.last_shuf = CustomPixelShuffle_ICNR(embed_dim, embed_dim, blur=self.blur, norm_type=self.last_norm, scale=4)
+
+        # guide heads for explicit mid-level supervision (training-time optional)
+        self.guide_heads = nn.ModuleList([
+            nn.Conv2d(self.nf, 2, kernel_size=1),
+            nn.Conv2d(self.nf, 2, kernel_size=1),
+            nn.Conv2d(self.nf // 2, 2, kernel_size=1),
+        ])
         
         if self.decoder_name == 'MultiScaleColorDecoder':
             self.color_decoder = MultiScaleColorDecoder(
@@ -133,7 +148,7 @@ class Decoder(nn.Module):
             )
 
 
-    def forward(self, cond_tokens_per_scale=None, cond_pos_per_scale=None):
+    def forward(self, cond_tokens_per_scale=None, cond_pos_per_scale=None, return_guides=False):
         encode_feat = self.hooks[-1].feature
         out0 = self.layers[0](encode_feat)
         out1 = self.layers[1](out0) 
@@ -149,7 +164,15 @@ class Decoder(nn.Module):
             )
         else:
             out = self.color_decoder(out3, encode_feat)
-           
+
+        if return_guides:
+            guide_preds = [
+                self.guide_heads[0](out0),
+                self.guide_heads[1](out1),
+                self.guide_heads[2](out2),
+            ]
+            return out, guide_preds
+
         return out
 
     def make_layers(self):

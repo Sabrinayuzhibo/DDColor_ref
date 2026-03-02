@@ -1,7 +1,7 @@
-#! condB grid + pos enc: 20k train, ddcolor_artistic backbone
-#! 方向B：冻结 ConvNeXt encoder，仅训练 decoder + cond gate + conditioner(net_c)
+#! condB grid + pos enc: 20k hard-ref train from scratch, ddcolor_artistic backbone
+#! 方向B：冻结 ConvNeXt encoder，仅训练 color decoder(+cond gate) + conditioner(net_c)
 
-name: train_ddcolor_condB_p1_grid_posenc_20k_artist_color_decoder_cond_style15_local
+name: train_ddcolor_condB_p1_grid_posenc_20k_artist_color_decoder_cond_style15_local_guide_hardref
 model_type: ColorModel
 scale: 1
 num_gpu: 1
@@ -82,7 +82,7 @@ network_g:
   num_scales: 3
   dec_layers: 9
   use_cond_gate: true
-  cond_gate_init: -1.5
+  cond_gate_init: -1.2
   last_norm: Spectral
   num_output_channels: 2
   do_normalize: False
@@ -103,7 +103,6 @@ path:
   resume_state: ~
 
 train:
-  # 更细粒度：冻结 encoder + pixel decoder，仅训练 color decoder(+cond gate) + net_c
   train_only_cond: false
   train_decoder_cond: false
   train_color_decoder_cond: true
@@ -118,8 +117,8 @@ train:
     use_spatial_pos: true
     spatial_pos_type: learnable
     include_area_frac: true
-    # encoder 已冻结，这里也走 no_grad，减少显存与计算
     freeze_ref_encoder: true
+    gain: 1.20
 
   color_enhance: True
   color_enhance_factor: 1.08
@@ -131,7 +130,7 @@ train:
     betas: [0.9, 0.99]
   optim_d:
     type: Adam
-    lr: !!float 1.0e-5
+    lr: !!float 8.0e-6
     weight_decay: 0
     betas: [0.9, 0.99]
 
@@ -145,7 +144,7 @@ train:
 
   pixel_opt:
     type: L1Loss
-    loss_weight: 0.0030
+    loss_weight: 0.0025
     reduction: mean
 
   perceptual_opt:
@@ -159,7 +158,7 @@ train:
     vgg_type: vgg16_bn
     use_input_norm: true
     range_norm: false
-    perceptual_weight: 0.10
+    perceptual_weight: 0.08
     style_weight: 0
     criterion: l1
 
@@ -175,45 +174,55 @@ train:
     use_input_norm: true
     range_norm: false
     perceptual_weight: 0.0
-    style_weight: 1.5
+    style_weight: 2.5
     criterion: l1
 
-  # No-mask reference strengthening: global color-moment alignment
   ref_moment_opt:
     enable: true
-    loss_weight: 0.080
+    loss_weight: 0.18
     use_std: true
 
-  # No-mask reference strengthening: in-batch contrastive reference preference
+  ref_cov_opt:
+    enable: true
+    loss_weight: 0.10
+
   ref_contrast_opt:
     enable: true
-    loss_weight: 0.040
-    margin: 0.050
+    loss_weight: 0.10
+    margin: 0.10
     use_std: true
+    hard_negative: true
 
   local_ab_opt:
     enable: true
-    loss_weight: 0.010
+    loss_weight: 0.012
     reduction: mean
     focus_ratio: 0.25
     boost: 4.0
     edge_power: 1.0
+
+  guide_opt:
+    enable: true
+    loss_weight: 0.040
+    reduction: mean
+    weights: [0.20, 0.35, 0.60]
+    gray_target_first: true
 
   gan_opt:
     type: GANLoss
     gan_type: vanilla
     real_label_val: 1.0
     fake_label_val: 0.0
-    loss_weight: 0.24
+    loss_weight: 0.18
 
   colorfulness_opt:
     type: ColorfulnessLoss
-    loss_weight: 0.012
+    loss_weight: 0.010
 
   cond_gate_push_opt:
     enable: true
-    loss_weight: 0.12
-    target_sigmoid: 0.45
+    loss_weight: 0.25
+    target_sigmoid: 0.65
 
 val:
   val_freq: !!float 2000

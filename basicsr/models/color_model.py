@@ -1,6 +1,7 @@
 import os
 import torch
 import itertools
+import torch.nn.functional as F
 from collections import OrderedDict
 from os import path as osp
 from tqdm import tqdm
@@ -113,6 +114,14 @@ class ColorModel(BaseModel):
                 raise ValueError('train_color_decoder_cond=True 但 net_g.decoder.color_decoder 不存在。')
             for p in color_dec.parameters():
                 p.requires_grad = True
+
+            # optional: when guide supervision is enabled, also train guide heads
+            guide_opt = self.opt.get('train', {}).get('guide_opt', {})
+            if bool(guide_opt.get('enable', False)):
+                guide_heads = getattr(dec, 'guide_heads', None)
+                if guide_heads is not None:
+                    for p in guide_heads.parameters():
+                        p.requires_grad = True
         
         # load pretrained model for net_g
         load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -212,6 +221,42 @@ class ColorModel(BaseModel):
         else:
             self.cri_local_ab = None
 
+        # Optional guide-head loss (explicit mid-level supervision)
+        guide_opt = train_opt.get('guide_opt', None)
+        self.guide_opt = guide_opt if (guide_opt and guide_opt.get('enable', False)) else None
+        if self.guide_opt is not None:
+            loss_weight = float(self.guide_opt.get('loss_weight', 0.0))
+            reduction = str(self.guide_opt.get('reduction', 'mean'))
+            if loss_weight <= 0:
+                self.cri_guide = None
+            else:
+                self.cri_guide = build_loss({
+                    'type': 'L1Loss',
+                    'loss_weight': loss_weight,
+                    'reduction': reduction,
+                }).to(self.device)
+            self.guide_weights = [float(x) for x in self.guide_opt.get('weights', [0.20, 0.35, 0.60])]
+            self.guide_gray_first = bool(self.guide_opt.get('gray_target_first', True))
+        else:
+            self.cri_guide = None
+            self.guide_weights = []
+            self.guide_gray_first = True
+
+        # Optional reference moment loss (no mask): match global RGB mean/std to reference.
+        # This directly increases reference-following strength in color distribution.
+        ref_moment_opt = train_opt.get('ref_moment_opt', None)
+        self.ref_moment_opt = ref_moment_opt if (ref_moment_opt and ref_moment_opt.get('enable', False)) else None
+
+        # Optional batch contrastive reference loss (no mask):
+        # output should be closer to its own ref than to another sample's ref.
+        ref_contrast_opt = train_opt.get('ref_contrast_opt', None)
+        self.ref_contrast_opt = ref_contrast_opt if (ref_contrast_opt and ref_contrast_opt.get('enable', False)) else None
+
+        # Optional reference covariance loss (no mask):
+        # align RGB channel covariance/correlation to reference for stronger palette coupling.
+        ref_cov_opt = train_opt.get('ref_cov_opt', None)
+        self.ref_cov_opt = ref_cov_opt if (ref_cov_opt and ref_cov_opt.get('enable', False)) else None
+
         # set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
@@ -309,6 +354,45 @@ class ColorModel(BaseModel):
         w_local = w_local.repeat(1, 2, 1, 1)
         return w_local
 
+    def _rgb_channel_moment_distance(self, pred_rgb, ref_rgb, use_std: bool = True):
+        """L1 distance between per-channel global moments of two RGB tensors."""
+        pred_mean = pred_rgb.mean(dim=(2, 3))
+        ref_mean = ref_rgb.mean(dim=(2, 3))
+        dist = torch.abs(pred_mean - ref_mean).mean(dim=1)
+        if use_std:
+            pred_std = pred_rgb.std(dim=(2, 3), unbiased=False)
+            ref_std = ref_rgb.std(dim=(2, 3), unbiased=False)
+            dist = dist + torch.abs(pred_std - ref_std).mean(dim=1)
+        return dist
+
+    def _rgb_channel_cov_distance(self, pred_rgb, ref_rgb, eps: float = 1e-6):
+        """L1 distance between per-sample RGB channel covariance matrices."""
+        b, c, h, w = pred_rgb.shape
+        if c != 3:
+            raise ValueError(f'Expected RGB with 3 channels, got {c}.')
+
+        n = h * w
+        pred_flat = pred_rgb.view(b, c, n)
+        ref_flat = ref_rgb.view(b, c, n)
+
+        pred_centered = pred_flat - pred_flat.mean(dim=2, keepdim=True)
+        ref_centered = ref_flat - ref_flat.mean(dim=2, keepdim=True)
+
+        denom = max(n - 1, 1)
+        pred_cov = torch.bmm(pred_centered, pred_centered.transpose(1, 2)) / float(denom)
+        ref_cov = torch.bmm(ref_centered, ref_centered.transpose(1, 2)) / float(denom)
+
+        pred_std = torch.sqrt(torch.diagonal(pred_cov, dim1=1, dim2=2).clamp_min(eps))
+        ref_std = torch.sqrt(torch.diagonal(ref_cov, dim1=1, dim2=2).clamp_min(eps))
+        pred_norm = pred_std.unsqueeze(2) * pred_std.unsqueeze(1)
+        ref_norm = ref_std.unsqueeze(2) * ref_std.unsqueeze(1)
+        pred_corr = pred_cov / pred_norm.clamp_min(eps)
+        ref_corr = ref_cov / ref_norm.clamp_min(eps)
+
+        cov_dist = torch.abs(pred_cov - ref_cov).mean(dim=(1, 2))
+        corr_dist = torch.abs(pred_corr - ref_corr).mean(dim=(1, 2))
+        return cov_dist + corr_dist
+
     def optimize_parameters(self, current_iter):
         train_opt = self.opt['train']
         # optimize net_g
@@ -342,7 +426,17 @@ class ColorModel(BaseModel):
                 cond_tokens_per_scale = [t * cond_gain for t in cond_tokens_per_scale]
         
         # Forward with optional conditioning (DDColor supports cond_tokens/cond_pos aliases)
-        self.output_ab = self.net_g(self.lq_rgb, cond_tokens=cond_tokens_per_scale, cond_pos=cond_pos_per_scale)
+        if self.cri_guide is not None:
+            self.output_ab, guide_preds = self.net_g(
+                self.lq_rgb,
+                cond_tokens=cond_tokens_per_scale,
+                cond_pos=cond_pos_per_scale,
+                return_guides=True,
+            )
+            self.guide_preds = guide_preds
+        else:
+            self.output_ab = self.net_g(self.lq_rgb, cond_tokens=cond_tokens_per_scale, cond_pos=cond_pos_per_scale)
+            self.guide_preds = None
         self.output_lab = torch.cat([self.lq, self.output_ab], dim=1)
         self.output_rgb = tensor_lab2rgb(self.output_lab)
 
@@ -360,6 +454,23 @@ class ColorModel(BaseModel):
                 l_g_local_ab = self.cri_local_ab(self.output_ab, self.gt, weight=local_w)
                 l_g_total += l_g_local_ab
                 loss_dict['l_g_local_ab'] = l_g_local_ab
+
+        if self.cri_guide is not None and self.guide_preds is not None:
+            l_guide_total = 0
+            for idx, g in enumerate(self.guide_preds):
+                w = self.guide_weights[idx] if idx < len(self.guide_weights) else 1.0
+                if w <= 0:
+                    continue
+                g_up = F.interpolate(g, size=self.gt.shape[-2:], mode='bilinear', align_corners=False)
+                if idx == 0 and self.guide_gray_first:
+                    target = torch.zeros_like(self.gt)
+                else:
+                    target = self.gt
+                l_i = self.cri_guide(g_up, target) * w
+                l_guide_total = l_guide_total + l_i
+            if isinstance(l_guide_total, torch.Tensor):
+                l_g_total += l_guide_total
+                loss_dict['l_g_guide'] = l_guide_total
 
         # perceptual loss
         if self.cri_perceptual:
@@ -380,6 +491,48 @@ class ColorModel(BaseModel):
             if l_r_style is not None:
                 l_g_total += l_r_style
                 loss_dict['l_ref_style'] = l_r_style
+
+        # reference moment matching (stronger global color adherence to reference)
+        if self.ref_moment_opt is not None and getattr(self, 'ref_rgb', None) is not None:
+            w = float(self.ref_moment_opt.get('loss_weight', 0.0))
+            use_std = bool(self.ref_moment_opt.get('use_std', True))
+            if w > 0:
+                d_pos = self._rgb_channel_moment_distance(self.output_rgb, self.ref_rgb, use_std=use_std)
+                l_ref_moment = d_pos.mean() * w
+                l_g_total += l_ref_moment
+                loss_dict['l_ref_moment'] = l_ref_moment
+
+        # reference covariance matching (stronger cross-channel style adherence)
+        if self.ref_cov_opt is not None and getattr(self, 'ref_rgb', None) is not None:
+            w = float(self.ref_cov_opt.get('loss_weight', 0.0))
+            if w > 0:
+                d_cov = self._rgb_channel_cov_distance(self.output_rgb, self.ref_rgb)
+                l_ref_cov = d_cov.mean() * w
+                l_g_total += l_ref_cov
+                loss_dict['l_ref_cov'] = l_ref_cov
+
+        # batch contrastive reference loss: own ref should be closer than negative ref
+        if self.ref_contrast_opt is not None and getattr(self, 'ref_rgb', None) is not None:
+            w = float(self.ref_contrast_opt.get('loss_weight', 0.0))
+            margin = float(self.ref_contrast_opt.get('margin', 0.05))
+            use_std = bool(self.ref_contrast_opt.get('use_std', True))
+            hard_negative = bool(self.ref_contrast_opt.get('hard_negative', False))
+            if w > 0 and self.output_rgb.shape[0] > 1:
+                d_pos = self._rgb_channel_moment_distance(self.output_rgb, self.ref_rgb, use_std=use_std)
+                if hard_negative:
+                    bsz = self.output_rgb.shape[0]
+                    d_neg_list = []
+                    for shift in range(1, bsz):
+                        neg_ref_s = torch.roll(self.ref_rgb, shifts=shift, dims=0)
+                        d_neg_s = self._rgb_channel_moment_distance(self.output_rgb, neg_ref_s, use_std=use_std)
+                        d_neg_list.append(d_neg_s.unsqueeze(1))
+                    d_neg = torch.cat(d_neg_list, dim=1).min(dim=1).values
+                else:
+                    neg_ref = torch.roll(self.ref_rgb, shifts=1, dims=0)
+                    d_neg = self._rgb_channel_moment_distance(self.output_rgb, neg_ref, use_std=use_std)
+                l_ref_contrast = torch.relu(margin + d_pos - d_neg).mean() * w
+                l_g_total += l_ref_contrast
+                loss_dict['l_ref_contrast'] = l_ref_contrast
 
         # optional: push cond gate to open a bit (avoid "reference has no effect")
         gate_push_opt = train_opt.get('cond_gate_push_opt', None)

@@ -1,7 +1,7 @@
 #! condB grid + pos enc: 20k train, ddcolor_artistic backbone
 #! 方向B：冻结 ConvNeXt encoder，仅训练 decoder + cond gate + conditioner(net_c)
 
-name: train_ddcolor_condB_p1_grid_posenc_20k_artist_color_decoder_cond_style15_local
+name: train_ddcolor_condB_p1_grid_posenc_2k_artist_color_decoder_cond_style15_local_guide
 model_type: ColorModel
 scale: 1
 num_gpu: 1
@@ -137,10 +137,10 @@ train:
 
   scheduler:
     type: MultiStepLR
-    milestones: [12000, 17000]
+    milestones: [1200, 1700]
     gamma: 0.5
 
-  total_iter: 20000
+  total_iter: 2000
   warmup_iter: -1
 
   pixel_opt:
@@ -199,6 +199,13 @@ train:
     boost: 4.0
     edge_power: 1.0
 
+  guide_opt:
+    enable: true
+    loss_weight: 0.030
+    reduction: mean
+    weights: [0.20, 0.35, 0.60]
+    gray_target_first: true
+
   gan_opt:
     type: GANLoss
     gan_type: vanilla
@@ -216,7 +223,7 @@ train:
     target_sigmoid: 0.45
 
 val:
-  val_freq: !!float 2000
+  val_freq: !!float 500
   save_img: false
   pbar: false
   suffix: ~
@@ -226,7 +233,7 @@ logger:
   print_freq: 100
   save_snapshot_freq: ~
   save_snapshot_verbose: false
-  save_checkpoint_freq: !!float 2000
+  save_checkpoint_freq: !!float 500
   use_tb_logger: true
   wandb:
     project: ~
