@@ -1,7 +1,7 @@
-#! condB grid + pos enc: 384-res 2k hard-ref train from scratch, ddcolor_artistic backbone
+#! condB grid + pos enc: 384-res 2k tuned-from-scratch (not resume)
 #! 方向B：冻结 ConvNeXt encoder，仅训练 color decoder(+cond gate) + conditioner(net_c)
 
-name: train_ddcolor_condB_p1_grid_posenc_384_2k_artist_color_decoder_cond_style15_local_guide_hardref
+name: train_ddcolor_condB_p1_grid_posenc_384_2k_artist_color_decoder_cond_style15_local_guide_ultra_tuned_fromscratch
 model_type: ColorModel
 scale: 1
 num_gpu: 1
@@ -118,19 +118,19 @@ train:
     spatial_pos_type: learnable
     include_area_frac: true
     freeze_ref_encoder: true
-    gain: 1.20
+    gain: 1.6
 
   color_enhance: True
   color_enhance_factor: 1.08
 
   optim_g:
     type: AdamW
-    lr: !!float 8.0e-6
+    lr: !!float 1.2e-5
     weight_decay: 0.01
     betas: [0.9, 0.99]
   optim_d:
     type: Adam
-    lr: !!float 6.0e-6
+    lr: !!float 5.0e-6
     weight_decay: 0
     betas: [0.9, 0.99]
 
@@ -144,7 +144,7 @@ train:
 
   pixel_opt:
     type: L1Loss
-    loss_weight: 0.0025
+    loss_weight: 0.0020
     reduction: mean
 
   perceptual_opt:
@@ -158,7 +158,7 @@ train:
     vgg_type: vgg16_bn
     use_input_norm: true
     range_norm: false
-    perceptual_weight: 0.08
+    perceptual_weight: 0.06
     style_weight: 0
     criterion: l1
 
@@ -174,22 +174,22 @@ train:
     use_input_norm: true
     range_norm: false
     perceptual_weight: 0.0
-    style_weight: 2.5
+    style_weight: 2.8
     criterion: l1
 
   ref_moment_opt:
     enable: true
-    loss_weight: 0.18
+    loss_weight: 0.22
     use_std: true
 
   ref_cov_opt:
     enable: true
-    loss_weight: 0.10
+    loss_weight: 0.12
 
   ref_contrast_opt:
     enable: true
-    loss_weight: 0.10
-    margin: 0.10
+    loss_weight: 0.12
+    margin: 0.15
     use_std: true
     hard_negative: true
 
@@ -203,7 +203,7 @@ train:
 
   guide_opt:
     enable: true
-    loss_weight: 0.040
+    loss_weight: 0.05
     reduction: mean
     weights: [0.20, 0.35, 0.60]
     gray_target_first: true
@@ -213,16 +213,16 @@ train:
     gan_type: vanilla
     real_label_val: 1.0
     fake_label_val: 0.0
-    loss_weight: 0.18
+    loss_weight: 0.10
 
   colorfulness_opt:
     type: ColorfulnessLoss
-    loss_weight: 0.010
+    loss_weight: 0.06
 
   cond_gate_push_opt:
     enable: true
     loss_weight: 0.25
-    target_sigmoid: 0.65
+    target_sigmoid: 0.70
 
 val:
   val_freq: !!float 500

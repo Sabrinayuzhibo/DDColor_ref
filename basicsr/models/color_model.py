@@ -257,6 +257,9 @@ class ColorModel(BaseModel):
         ref_cov_opt = train_opt.get('ref_cov_opt', None)
         self.ref_cov_opt = ref_cov_opt if (ref_cov_opt and ref_cov_opt.get('enable', False)) else None
 
+        # Build lazy conditioner modules (e.g., grid input_proj) before optimizer collects params.
+        self._warmup_conditioner_lazy_modules()
+
         # set up optimizers and schedulers
         self.setup_optimizers()
         self.setup_schedulers()
@@ -392,6 +395,50 @@ class ColorModel(BaseModel):
         cov_dist = torch.abs(pred_cov - ref_cov).mean(dim=(1, 2))
         corr_dist = torch.abs(pred_corr - ref_corr).mean(dim=(1, 2))
         return cov_dist + corr_dist
+
+    def _warmup_conditioner_lazy_modules(self):
+        """Warm up conditioner once so lazy-created params are visible to optimizer."""
+        if not (self.cond_enable and self.net_c is not None):
+            return
+
+        net_g = self.get_bare_model(self.net_g)
+        net_c = self.get_bare_model(self.net_c)
+        logger = get_root_logger()
+
+        grid_cond = getattr(net_c, 'grid_conditioner', None)
+        if grid_cond is None:
+            return
+        if getattr(grid_cond, 'input_proj', None) is not None:
+            return
+
+        train_gt_size = int(self.opt.get('datasets', {}).get('train', {}).get('gt_size', 256))
+        train_gt_size = max(64, train_gt_size)
+        was_g_train = net_g.training
+        was_c_train = net_c.training
+
+        try:
+            net_g.eval()
+            net_c.eval()
+            with torch.no_grad():
+                dummy_ref = torch.zeros((1, 3, train_gt_size, train_gt_size), device=self.device)
+                dummy_ref_in = net_g.normalize(dummy_ref) if hasattr(net_g, 'normalize') else dummy_ref
+                _ = net_g.encoder(dummy_ref_in)
+                hooks = net_g.encoder.hooks
+                ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+                _ = net_c(ref_feats)
+
+            built = getattr(getattr(net_c, 'grid_conditioner', None), 'input_proj', None)
+            if built is not None:
+                logger.info(f'Conditioner warmup built input_proj with {len(built)} levels before optimizer setup.')
+            else:
+                logger.warning('Conditioner warmup finished but input_proj is still None.')
+        except Exception as e:
+            logger.warning(f'Conditioner warmup failed: {e}')
+        finally:
+            if was_g_train:
+                net_g.train()
+            if was_c_train:
+                net_c.train()
 
     def optimize_parameters(self, current_iter):
         train_opt = self.opt['train']
