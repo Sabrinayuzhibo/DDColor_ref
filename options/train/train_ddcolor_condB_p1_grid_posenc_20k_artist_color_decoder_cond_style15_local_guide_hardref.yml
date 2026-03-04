@@ -201,13 +201,6 @@ train:
     boost: 4.0
     edge_power: 1.0
 
-  guide_opt:
-    enable: true
-    loss_weight: 0.040
-    reduction: mean
-    weights: [0.20, 0.35, 0.60]
-    gray_target_first: true
-
   gan_opt:
     type: GANLoss
     gan_type: vanilla

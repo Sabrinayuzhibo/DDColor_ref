@@ -1,7 +1,6 @@
 import os
 import torch
 import itertools
-import torch.nn.functional as F
 from collections import OrderedDict
 from os import path as osp
 from tqdm import tqdm
@@ -114,14 +113,6 @@ class ColorModel(BaseModel):
                 raise ValueError('train_color_decoder_cond=True 但 net_g.decoder.color_decoder 不存在。')
             for p in color_dec.parameters():
                 p.requires_grad = True
-
-            # optional: when guide supervision is enabled, also train guide heads
-            guide_opt = self.opt.get('train', {}).get('guide_opt', {})
-            if bool(guide_opt.get('enable', False)):
-                guide_heads = getattr(dec, 'guide_heads', None)
-                if guide_heads is not None:
-                    for p in guide_heads.parameters():
-                        p.requires_grad = True
         
         # load pretrained model for net_g
         load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -220,27 +211,6 @@ class ColorModel(BaseModel):
                 }).to(self.device)
         else:
             self.cri_local_ab = None
-
-        # Optional guide-head loss (explicit mid-level supervision)
-        guide_opt = train_opt.get('guide_opt', None)
-        self.guide_opt = guide_opt if (guide_opt and guide_opt.get('enable', False)) else None
-        if self.guide_opt is not None:
-            loss_weight = float(self.guide_opt.get('loss_weight', 0.0))
-            reduction = str(self.guide_opt.get('reduction', 'mean'))
-            if loss_weight <= 0:
-                self.cri_guide = None
-            else:
-                self.cri_guide = build_loss({
-                    'type': 'L1Loss',
-                    'loss_weight': loss_weight,
-                    'reduction': reduction,
-                }).to(self.device)
-            self.guide_weights = [float(x) for x in self.guide_opt.get('weights', [0.20, 0.35, 0.60])]
-            self.guide_gray_first = bool(self.guide_opt.get('gray_target_first', True))
-        else:
-            self.cri_guide = None
-            self.guide_weights = []
-            self.guide_gray_first = True
 
         # Optional reference moment loss (no mask): match global RGB mean/std to reference.
         # This directly increases reference-following strength in color distribution.
@@ -473,17 +443,7 @@ class ColorModel(BaseModel):
                 cond_tokens_per_scale = [t * cond_gain for t in cond_tokens_per_scale]
         
         # Forward with optional conditioning (DDColor supports cond_tokens/cond_pos aliases)
-        if self.cri_guide is not None:
-            self.output_ab, guide_preds = self.net_g(
-                self.lq_rgb,
-                cond_tokens=cond_tokens_per_scale,
-                cond_pos=cond_pos_per_scale,
-                return_guides=True,
-            )
-            self.guide_preds = guide_preds
-        else:
-            self.output_ab = self.net_g(self.lq_rgb, cond_tokens=cond_tokens_per_scale, cond_pos=cond_pos_per_scale)
-            self.guide_preds = None
+        self.output_ab = self.net_g(self.lq_rgb, cond_tokens=cond_tokens_per_scale, cond_pos=cond_pos_per_scale)
         self.output_lab = torch.cat([self.lq, self.output_ab], dim=1)
         self.output_rgb = tensor_lab2rgb(self.output_lab)
 
@@ -501,23 +461,6 @@ class ColorModel(BaseModel):
                 l_g_local_ab = self.cri_local_ab(self.output_ab, self.gt, weight=local_w)
                 l_g_total += l_g_local_ab
                 loss_dict['l_g_local_ab'] = l_g_local_ab
-
-        if self.cri_guide is not None and self.guide_preds is not None:
-            l_guide_total = 0
-            for idx, g in enumerate(self.guide_preds):
-                w = self.guide_weights[idx] if idx < len(self.guide_weights) else 1.0
-                if w <= 0:
-                    continue
-                g_up = F.interpolate(g, size=self.gt.shape[-2:], mode='bilinear', align_corners=False)
-                if idx == 0 and self.guide_gray_first:
-                    target = torch.zeros_like(self.gt)
-                else:
-                    target = self.gt
-                l_i = self.cri_guide(g_up, target) * w
-                l_guide_total = l_guide_total + l_i
-            if isinstance(l_guide_total, torch.Tensor):
-                l_g_total += l_guide_total
-                loss_dict['l_g_guide'] = l_guide_total
 
         # perceptual loss
         if self.cri_perceptual:
