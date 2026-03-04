@@ -240,10 +240,13 @@ def _build_cond_from_reference(
     ref_rgb = cv2.cvtColor(ref_resized, cv2.COLOR_BGR2RGB)
     ref_tensor = torch.from_numpy(ref_rgb.transpose((2, 0, 1))).float().unsqueeze(0).to(device)
 
-    ref_in = model.normalize(ref_tensor) if hasattr(model, "normalize") else ref_tensor
-    _ = model.encoder(ref_in)
-    hooks = model.encoder.hooks
-    ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+    if hasattr(model, "extract_condition_features"):
+        ref_feats = model.extract_condition_features(ref_tensor, use_pixel_decoder=True)
+    else:
+        ref_in = model.normalize(ref_tensor) if hasattr(model, "normalize") else ref_tensor
+        _ = model.encoder(ref_in)
+        hooks = model.encoder.hooks
+        ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
 
     cond_tokens_per_scale, cond_pos_per_scale = conditioner(ref_feats)
     if cond_gain != 1.0 and cond_tokens_per_scale is not None:

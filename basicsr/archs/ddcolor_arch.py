@@ -59,18 +59,29 @@ class DDColor(nn.Module):
     def denormalize(self, img):
         return img * self.std + self.mean
 
+    def extract_condition_features(self, x, use_pixel_decoder=True):
+        """提取给 conditioner 使用的三尺度特征。"""
+        if x.shape[1] == 3:
+            x = self.normalize(x)
+
+        self.encoder(x)
+        if use_pixel_decoder:
+            return self.decoder.get_condition_features()
+
+        hooks = self.encoder.hooks
+        return [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+
     def forward(
         self,
         x,
         cond_tokens_per_scale=None,
         cond_pos_per_scale=None,
-        # Backwards-compat keyword aliases used by `scripts/infer_style_transfer.py`
+        # 向后兼容：支持旧脚本使用的别名参数
         cond_tokens=None,
         cond_pos=None,
     ):
-        # Allow both the new `(cond_tokens_per_scale, cond_pos_per_scale)` API
-        # and the legacy `(cond_tokens, cond_pos)` names used in inference
-        # scripts. If the compact aliases are provided, they override.
+        # 同时支持新接口 `(cond_tokens_per_scale, cond_pos_per_scale)`
+        # 与旧接口 `(cond_tokens, cond_pos)`；若旧接口传入则覆盖前者。
         if cond_tokens is not None:
             cond_tokens_per_scale = cond_tokens
         if cond_pos is not None:
@@ -152,6 +163,14 @@ class Decoder(nn.Module):
             out = self.color_decoder(out3, encode_feat)
 
         return out
+
+    def get_condition_features(self):
+        """返回 pixel decoder 的三尺度特征（out0/out1/out2）。"""
+        encode_feat = self.hooks[-1].feature
+        out0 = self.layers[0](encode_feat)
+        out1 = self.layers[1](out0)
+        out2 = self.layers[2](out1)
+        return [out0, out1, out2]
 
     def make_layers(self):
         decoder_layers = []
@@ -255,11 +274,11 @@ class MultiScaleColorDecoder(nn.Module):
     ):
         super().__init__()
 
-        # positional encoding
+        # 位置编码
         N_steps = hidden_dim // 2
         self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
 
-        # define Transformer decoder here
+        # 构建 Transformer 解码器
         self.num_heads = nheads
         self.num_layers = dec_layers
         self.transformer_self_attention_layers = nn.ModuleList()
@@ -306,12 +325,12 @@ class MultiScaleColorDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(hidden_dim)
 
         self.num_queries = num_queries
-        # learnable color query features
+        # 可学习的颜色 query 特征
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
-        # learnable color query p.e.
+        # 可学习的颜色 query 位置编码
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
-        # level embedding
+        # 多尺度 level embedding
         self.num_feature_levels = num_scales
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
 
@@ -325,7 +344,7 @@ class MultiScaleColorDecoder(nn.Module):
         else:
             self.register_parameter('cond_gate_logit', None)
 
-        # input projections
+        # 输入投影层
         self.input_proj = nn.ModuleList()
         for i in range(self.num_feature_levels):
             if in_channels[i] != hidden_dim or enforce_input_project:
@@ -336,11 +355,11 @@ class MultiScaleColorDecoder(nn.Module):
             else:
                 self.input_proj.append(nn.Sequential())
 
-        # output FFNs
+        # 输出 FFN
         self.color_embed = MLP(hidden_dim, hidden_dim, color_embed_dim, 3)
 
     def forward(self, x, img_features, cond_tokens_per_scale=None, cond_pos_per_scale=None):
-        # x is a list of multi-scale feature
+        # x 是多尺度特征列表
         assert len(x) == self.num_feature_levels
         src = []
         pos = []
@@ -349,13 +368,13 @@ class MultiScaleColorDecoder(nn.Module):
             pos.append(self.pe_layer(x[i], None).flatten(2))
             src.append(self.input_proj[i](x[i]).flatten(2) + self.level_embed.weight[i][None, :, None])
 
-            # flatten NxCxHxW to HWxNxC
+            # 将 NxCxHxW 展平为 HWxNxC
             pos[-1] = pos[-1].permute(2, 0, 1)
             src[-1] = src[-1].permute(2, 0, 1)    
 
         _, bs, _ = src[0].shape
 
-        # QxNxC
+        # Query 形状：QxNxC
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
 
@@ -385,7 +404,7 @@ class MultiScaleColorDecoder(nn.Module):
                     gate=gate,
                 )
 
-            # 2) 再对图像多尺度特征做原始 cross-attn
+            # 2) 再对当前尺度图像特征做原始 cross-attn
             output = self.transformer_cross_attention_layers[i](
                 output,
                 src[level_index],

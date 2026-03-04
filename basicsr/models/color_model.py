@@ -17,8 +17,8 @@ from basicsr.utils.registry import MODEL_REGISTRY
 from .base_model import BaseModel
 from basicsr.utils.color_enhance import color_enhacne_blend
 
-# Optional dependency: `custom_fid` requires SciPy. Make it lazy/optional so training
-# without FID metrics can still run in minimal environments.
+# 可选依赖：`custom_fid` 需要 SciPy。
+# 这里做成惰性/可选导入，保证在最小环境下（不计算 FID）也能正常训练。
 try:
     from basicsr.metrics.custom_fid import (
         INCEPTION_V3_FID,
@@ -40,7 +40,7 @@ class ColorModel(BaseModel):
     def __init__(self, opt):
         super(ColorModel, self).__init__(opt)
 
-        # define network net_g
+        # 构建主生成器 net_g
         self.net_g = build_network(opt['network_g'])
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
@@ -61,7 +61,7 @@ class ColorModel(BaseModel):
                     '请仅启用一个训练模式。'
                 )
 
-        # Optional reference conditioner net_c (DDColor cond-B)
+        # 可选参考条件分支 net_c（DDColor cond-B）
         self.cond_enable = bool(self.opt.get('train', {}).get('cond_opt', {}).get('enable', False)) if self.opt.get('is_train', False) else False
         self.net_c = None
         if self.cond_enable:
@@ -114,13 +114,13 @@ class ColorModel(BaseModel):
             for p in color_dec.parameters():
                 p.requires_grad = True
         
-        # load pretrained model for net_g
+        # 加载 net_g 预训练权重
         load_path = self.opt['path'].get('pretrain_network_g', None)
         if load_path is not None:
             param_key = self.opt['path'].get('param_key_g', 'params')
             self.load_network(self.net_g, load_path, self.opt['path'].get('strict_load_g', True), param_key)
 
-        # load pretrained model for net_c (optional)
+        # 加载 net_c 预训练权重（可选）
         if self.cond_enable and self.net_c is not None:
             load_path_c = self.opt['path'].get('pretrain_network_c', None)
             if load_path_c is not None:
@@ -137,24 +137,23 @@ class ColorModel(BaseModel):
         if self.ema_decay > 0:
             logger = get_root_logger()
             logger.info(f'Use Exponential Moving Average with decay: {self.ema_decay}')
-            # define network net_g with Exponential Moving Average (EMA)
-            # net_g_ema is used only for testing on one GPU and saving
-            # There is no need to wrap with DistributedDataParallel
+            # 构建 EMA 版本的 net_g
+            # net_g_ema 仅用于单卡测试和保存，无需再包 DDP
             self.net_g_ema = build_network(self.opt['network_g']).to(self.device)
-            # load pretrained model
+            # 加载预训练模型
             load_path = self.opt['path'].get('pretrain_network_g', None)
             if load_path is not None:
                 self.load_network(self.net_g_ema, load_path, self.opt['path'].get('strict_load_g', True), 'params_ema')
             else:
-                self.model_ema(0)  # copy net_g weight
+                self.model_ema(0)  # 拷贝当前 net_g 权重
             self.net_g_ema.eval()
 
-        # define network net_d
+        # 构建判别器 net_d
         self.net_d = build_network(self.opt['network_d'])
         self.net_d = self.model_to_device(self.net_d)
         self.print_network(self.net_d)
 
-        # load pretrained model for net_d
+        # 加载 net_d 预训练权重
         load_path = self.opt['path'].get('pretrain_network_d', None)
         if load_path is not None:
             param_key = self.opt['path'].get('param_key_d', 'params')
@@ -165,7 +164,7 @@ class ColorModel(BaseModel):
         if self.cond_enable and self.net_c is not None:
             self.net_c.train()
 
-        # define losses
+        # 构建各类损失
         if train_opt.get('pixel_opt'):
             self.cri_pix = build_loss(train_opt['pixel_opt']).to(self.device)
         else:
@@ -176,7 +175,7 @@ class ColorModel(BaseModel):
         else:
             self.cri_perceptual = None
 
-        # Reference style/perceptual loss (output vs reference image)
+        # 参考图风格/感知损失（输出图 vs 参考图）
         if train_opt.get('ref_style_opt'):
             self.cri_ref_style = build_loss(train_opt['ref_style_opt']).to(self.device)
         else:
@@ -195,7 +194,7 @@ class ColorModel(BaseModel):
         else:
             self.cri_colorfulness = None
 
-        # Optional local AB loss: emphasize high-gradient local regions (e.g., hair/edges)
+        # 可选局部 AB 损失：强调高梯度区域（如头发/边缘）
         local_ab_opt = train_opt.get('local_ab_opt', None)
         self.local_ab_opt = local_ab_opt if (local_ab_opt and local_ab_opt.get('enable', False)) else None
         if self.local_ab_opt is not None:
@@ -212,36 +211,36 @@ class ColorModel(BaseModel):
         else:
             self.cri_local_ab = None
 
-        # Optional reference moment loss (no mask): match global RGB mean/std to reference.
-        # This directly increases reference-following strength in color distribution.
+        # 可选参考矩匹配损失（无 mask）：对齐 RGB 全局均值/方差。
+        # 作用：直接增强“颜色分布跟随参考图”的能力。
         ref_moment_opt = train_opt.get('ref_moment_opt', None)
         self.ref_moment_opt = ref_moment_opt if (ref_moment_opt and ref_moment_opt.get('enable', False)) else None
 
-        # Optional batch contrastive reference loss (no mask):
-        # output should be closer to its own ref than to another sample's ref.
+        # 可选批内对比参考损失（无 mask）：
+        # 输出应更接近本样本参考图，而不是其他样本参考图。
         ref_contrast_opt = train_opt.get('ref_contrast_opt', None)
         self.ref_contrast_opt = ref_contrast_opt if (ref_contrast_opt and ref_contrast_opt.get('enable', False)) else None
 
-        # Optional reference covariance loss (no mask):
-        # align RGB channel covariance/correlation to reference for stronger palette coupling.
+        # 可选参考协方差损失（无 mask）：
+        # 对齐 RGB 通道协方差/相关性，增强调色盘耦合。
         ref_cov_opt = train_opt.get('ref_cov_opt', None)
         self.ref_cov_opt = ref_cov_opt if (ref_cov_opt and ref_cov_opt.get('enable', False)) else None
 
-        # Build lazy conditioner modules (e.g., grid input_proj) before optimizer collects params.
+        # 在收集优化器参数前，先构建 conditioner 的惰性模块（如 grid input_proj）。
         self._warmup_conditioner_lazy_modules()
 
-        # set up optimizers and schedulers
+        # 创建优化器与学习率调度器
         self.setup_optimizers()
         self.setup_schedulers()
 
-        # set real dataset cache for fid metric computing
+        # 准备 FID 计算所需的真实数据统计缓存
         self.real_mu, self.real_sigma = None, None
         if self.opt['val'].get('metrics') is not None and self.opt['val']['metrics'].get('fid') is not None:
             self._prepare_inception_model_fid()
 
     def setup_optimizers(self):
         train_opt = self.opt['train']
-        # 只训练 conditioner：优化器中只包含 net_c 的参数
+        # 若只训练 conditioner，优化器里仅包含 net_c 参数
         optim_params_g = []
         if getattr(self, 'train_only_cond', False):
             if not (self.cond_enable and self.net_c is not None):
@@ -263,12 +262,12 @@ class ColorModel(BaseModel):
         if len(optim_params_g) == 0:
             raise ValueError('No trainable parameters collected for optimizer_g. Please check freeze settings.')
 
-        # optimizer g
+        # 生成器优化器
         optim_type = train_opt['optim_g'].pop('type')
         self.optimizer_g = self.get_optimizer(optim_type, optim_params_g, **train_opt['optim_g'])
         self.optimizers.append(self.optimizer_g)
 
-        # optimizer d
+        # 判别器优化器
         optim_type = train_opt['optim_d'].pop('type')
         self.optimizer_d = self.get_optimizer(optim_type, self.net_d.parameters(), **train_opt['optim_d'])
         self.optimizers.append(self.optimizer_d)
@@ -281,7 +280,7 @@ class ColorModel(BaseModel):
             self.gt_lab = torch.cat([self.lq, self.gt], dim=1)
             self.gt_rgb = tensor_lab2rgb(self.gt_lab)
 
-            # optional reference image (RGB, [0,1])
+            # 可选参考图（RGB，[0,1]）
             self.ref_rgb = data.get('ref_rgb', None)
             if self.ref_rgb is not None:
                 self.ref_rgb = self.ref_rgb.to(self.device)
@@ -292,7 +291,7 @@ class ColorModel(BaseModel):
                     self.gt_rgb[i] = color_enhacne_blend(self.gt_rgb[i], factor=self.opt['train'].get('color_enhance_factor'))
 
     def _build_local_ab_weight(self):
-        """Build per-pixel AB weights from L-channel gradients (no extra annotations required)."""
+        """基于 L 通道梯度构建逐像素 AB 权重（无需额外标注）。"""
         if self.local_ab_opt is None:
             return None
 
@@ -328,7 +327,7 @@ class ColorModel(BaseModel):
         return w_local
 
     def _rgb_channel_moment_distance(self, pred_rgb, ref_rgb, use_std: bool = True):
-        """L1 distance between per-channel global moments of two RGB tensors."""
+        """计算两张 RGB 图在通道全局矩上的 L1 距离。"""
         pred_mean = pred_rgb.mean(dim=(2, 3))
         ref_mean = ref_rgb.mean(dim=(2, 3))
         dist = torch.abs(pred_mean - ref_mean).mean(dim=1)
@@ -339,7 +338,7 @@ class ColorModel(BaseModel):
         return dist
 
     def _rgb_channel_cov_distance(self, pred_rgb, ref_rgb, eps: float = 1e-6):
-        """L1 distance between per-sample RGB channel covariance matrices."""
+        """计算两张 RGB 图在通道协方差矩阵上的 L1 距离。"""
         b, c, h, w = pred_rgb.shape
         if c != 3:
             raise ValueError(f'Expected RGB with 3 channels, got {c}.')
@@ -367,7 +366,7 @@ class ColorModel(BaseModel):
         return cov_dist + corr_dist
 
     def _warmup_conditioner_lazy_modules(self):
-        """Warm up conditioner once so lazy-created params are visible to optimizer."""
+        """先 warmup 一次 conditioner，确保惰性参数在构建优化器前可见。"""
         if not (self.cond_enable and self.net_c is not None):
             return
 
@@ -391,10 +390,7 @@ class ColorModel(BaseModel):
             net_c.eval()
             with torch.no_grad():
                 dummy_ref = torch.zeros((1, 3, train_gt_size, train_gt_size), device=self.device)
-                dummy_ref_in = net_g.normalize(dummy_ref) if hasattr(net_g, 'normalize') else dummy_ref
-                _ = net_g.encoder(dummy_ref_in)
-                hooks = net_g.encoder.hooks
-                ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+                ref_feats = net_g.extract_condition_features(dummy_ref, use_pixel_decoder=True)
                 _ = net_c(ref_feats)
 
             built = getattr(getattr(net_c, 'grid_conditioner', None), 'input_proj', None)
@@ -412,7 +408,7 @@ class ColorModel(BaseModel):
 
     def optimize_parameters(self, current_iter):
         train_opt = self.opt['train']
-        # optimize net_g
+        # 优化 net_g
         for p in self.net_d.parameters():
             p.requires_grad = False
         self.optimizer_g.zero_grad()
@@ -424,32 +420,27 @@ class ColorModel(BaseModel):
             freeze_ref_encoder = bool(cond_opt.get('freeze_ref_encoder', False))
             cond_gain = float(cond_opt.get('gain', 1.0))
 
-            # Build conditioning tokens from reference features.
-            # NOTE: This runs the encoder on the reference once, then runs the full net_g forward on content.
-            # It is fine because we store ref_feats tensors immediately.
-            ref_in = self.net_g.normalize(self.ref_rgb) if hasattr(self.net_g, 'normalize') else self.ref_rgb
+            # 从参考图特征构建条件 tokens。
+            # 说明：这里会先跑一次参考图 encoder，再对内容图跑完整 net_g。
+            # 这样做是可行的，因为 ref_feats 会立即取出并用于 net_c。
             if freeze_ref_encoder:
                 with torch.no_grad():
-                    _ = self.net_g.encoder(ref_in)
-                    hooks = self.net_g.encoder.hooks
-                    ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+                    ref_feats = self.net_g.extract_condition_features(self.ref_rgb, use_pixel_decoder=True)
             else:
-                _ = self.net_g.encoder(ref_in)
-                hooks = self.net_g.encoder.hooks
-                ref_feats = [hooks[1].feature, hooks[2].feature, hooks[3].feature]
+                ref_feats = self.net_g.extract_condition_features(self.ref_rgb, use_pixel_decoder=True)
 
             cond_tokens_per_scale, cond_pos_per_scale = self.net_c(ref_feats)
             if cond_gain != 1.0 and cond_tokens_per_scale is not None:
                 cond_tokens_per_scale = [t * cond_gain for t in cond_tokens_per_scale]
         
-        # Forward with optional conditioning (DDColor supports cond_tokens/cond_pos aliases)
+        # 前向：可选注入条件 tokens（DDColor 支持 cond_tokens/cond_pos 别名）
         self.output_ab = self.net_g(self.lq_rgb, cond_tokens=cond_tokens_per_scale, cond_pos=cond_pos_per_scale)
         self.output_lab = torch.cat([self.lq, self.output_ab], dim=1)
         self.output_rgb = tensor_lab2rgb(self.output_lab)
 
         l_g_total = 0
         loss_dict = OrderedDict()
-        # pixel loss
+        # 像素损失
         if self.cri_pix:
             l_g_pix = self.cri_pix(self.output_ab, self.gt)
             l_g_total += l_g_pix
@@ -462,7 +453,7 @@ class ColorModel(BaseModel):
                 l_g_total += l_g_local_ab
                 loss_dict['l_g_local_ab'] = l_g_local_ab
 
-        # perceptual loss
+        # 感知损失
         if self.cri_perceptual:
             l_g_percep, l_g_style = self.cri_perceptual(self.output_rgb, self.gt_rgb)
             if l_g_percep is not None:
@@ -472,7 +463,7 @@ class ColorModel(BaseModel):
                 l_g_total += l_g_style
                 loss_dict['l_g_style'] = l_g_style
 
-        # reference style loss (output vs reference)
+        # 参考风格损失（输出 vs 参考图）
         if self.cri_ref_style and getattr(self, 'ref_rgb', None) is not None:
             l_r_percep, l_r_style = self.cri_ref_style(self.output_rgb, self.ref_rgb)
             if l_r_percep is not None:
@@ -482,7 +473,7 @@ class ColorModel(BaseModel):
                 l_g_total += l_r_style
                 loss_dict['l_ref_style'] = l_r_style
 
-        # reference moment matching (stronger global color adherence to reference)
+        # 参考矩匹配（增强全局颜色跟随）
         if self.ref_moment_opt is not None and getattr(self, 'ref_rgb', None) is not None:
             w = float(self.ref_moment_opt.get('loss_weight', 0.0))
             use_std = bool(self.ref_moment_opt.get('use_std', True))
@@ -492,7 +483,7 @@ class ColorModel(BaseModel):
                 l_g_total += l_ref_moment
                 loss_dict['l_ref_moment'] = l_ref_moment
 
-        # reference covariance matching (stronger cross-channel style adherence)
+        # 参考协方差匹配（增强跨通道风格跟随）
         if self.ref_cov_opt is not None and getattr(self, 'ref_rgb', None) is not None:
             w = float(self.ref_cov_opt.get('loss_weight', 0.0))
             if w > 0:
@@ -501,7 +492,7 @@ class ColorModel(BaseModel):
                 l_g_total += l_ref_cov
                 loss_dict['l_ref_cov'] = l_ref_cov
 
-        # batch contrastive reference loss: own ref should be closer than negative ref
+        # 批内对比参考损失：本样本参考图应比负样本参考图更近
         if self.ref_contrast_opt is not None and getattr(self, 'ref_rgb', None) is not None:
             w = float(self.ref_contrast_opt.get('loss_weight', 0.0))
             margin = float(self.ref_contrast_opt.get('margin', 0.05))
@@ -524,7 +515,7 @@ class ColorModel(BaseModel):
                 l_g_total += l_ref_contrast
                 loss_dict['l_ref_contrast'] = l_ref_contrast
 
-        # optional: push cond gate to open a bit (avoid "reference has no effect")
+        # 可选：推动 cond gate 适度打开（避免“参考图不起作用”）
         gate_push_opt = train_opt.get('cond_gate_push_opt', None)
         if gate_push_opt and gate_push_opt.get('enable', False):
             try:
@@ -538,15 +529,15 @@ class ColorModel(BaseModel):
                         l_g_total += l_gate
                         loss_dict['l_cond_gate_push'] = l_gate
             except Exception:
-                # keep training robust even if gate attr path changes
+                # 即使 gate 属性路径变化，也尽量不影响训练流程
                 pass
-        # gan loss
+            # GAN 损失
         if self.cri_gan:
             fake_g_pred = self.net_d(self.output_rgb)
             l_g_gan = self.cri_gan(fake_g_pred, target_is_real=True, is_disc=False)
             l_g_total += l_g_gan
             loss_dict['l_g_gan'] = l_g_gan
-        # colorfulness loss
+        # 色彩丰富度损失
         if self.cri_colorfulness:
             l_g_color = self.cri_colorfulness(self.output_rgb)
             l_g_total += l_g_color
@@ -555,7 +546,7 @@ class ColorModel(BaseModel):
         l_g_total.backward()
         self.optimizer_g.step()
 
-        # optimize net_d
+        # 优化 net_d
         for p in self.net_d.parameters():
             p.requires_grad = True
         self.optimizer_d.zero_grad()
@@ -579,14 +570,14 @@ class ColorModel(BaseModel):
         out_dict = OrderedDict()
         out_dict['lq'] = self.lq_rgb.detach().cpu()
         out_dict['result'] = self.output_rgb.detach().cpu()
-        if self.opt['logger'].get('save_snapshot_verbose', False):  # only for verbose
+        if self.opt['logger'].get('save_snapshot_verbose', False):  # 仅 verbose 模式保存
             self.output_lab_chroma = torch.cat([torch.ones_like(self.lq) * 50, self.output_ab], dim=1)
             self.output_rgb_chroma = tensor_lab2rgb(self.output_lab_chroma)
             out_dict['result_chroma'] = self.output_rgb_chroma.detach().cpu()
 
         if hasattr(self, 'gt'):
             out_dict['gt'] = self.gt_rgb.detach().cpu()
-            if self.opt['logger'].get('save_snapshot_verbose', False):  # only for verbose
+            if self.opt['logger'].get('save_snapshot_verbose', False):  # 仅 verbose 模式保存
                 self.gt_lab_chroma = torch.cat([torch.ones_like(self.lq) * 50, self.gt], dim=1)
                 self.gt_rgb_chroma = tensor_lab2rgb(self.gt_lab_chroma)
                 out_dict['gt_chroma'] = self.gt_rgb_chroma.detach().cpu()
@@ -616,12 +607,12 @@ class ColorModel(BaseModel):
         with_metrics = self.opt['val'].get('metrics') is not None
         use_pbar = self.opt['val'].get('pbar', False)
 
-        if with_metrics and not hasattr(self, 'metric_results'):  # only execute in the first run
+        if with_metrics and not hasattr(self, 'metric_results'):  # 仅首次验证时初始化
             self.metric_results = {metric: 0 for metric in self.opt['val']['metrics'].keys()}
-        # initialize the best metric results for each dataset_name (supporting multiple validation datasets)
+        # 初始化该数据集的最优指标记录（支持多验证集）
         if with_metrics:
             self._initialize_best_metric_results(dataset_name)
-        # zero self.metric_results
+        # 清空当前指标累计值
         if with_metrics:
             self.metric_results = {metric: 0 for metric in self.metric_results}
 
@@ -667,7 +658,7 @@ class ColorModel(BaseModel):
                     imwrite(sr_img, save_img_path)
 
             if with_metrics:
-                # calculate metrics
+                # 计算指标
                 for name, opt_ in self.opt['val']['metrics'].items():
                     if name == 'fid':
                         pred, gt = visuals['result'].cuda(), visuals['gt'].cuda()
@@ -698,7 +689,7 @@ class ColorModel(BaseModel):
             for metric in self.metric_results.keys():
                 if metric != 'fid':
                     self.metric_results[metric] /= (idx + 1)
-                # update the best metric result
+                # 更新最优指标
                 self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
 
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
