@@ -500,6 +500,7 @@ def main():
     parser.add_argument("--model_size", default="large", choices=["tiny", "large"])
     parser.add_argument("--num_queries", default=256, type=int)
     parser.add_argument("--num_scales", default=3, type=int)
+    parser.add_argument("--grid_size", default=16, type=int)
     parser.add_argument("--dec_layers", default=9, type=int)
     parser.add_argument("--cond_gain1", default=1.0, type=float, help="Gain for first reference conditioner")
     parser.add_argument("--cond_gain2", default=1.0, type=float, help="Gain for second reference conditioner")
@@ -594,9 +595,9 @@ def main():
 
     # 与训练配置一致的 dense/grid conditioner
     conditioner = MultiScaleDenseTokenConditioner(
-        num_scales=3,
+        num_scales=args.num_scales,
         hidden_dim=256,
-        grid_size=16,
+        grid_size=args.grid_size,
     ).to(device)
     conditioner.eval()
 

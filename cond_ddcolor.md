@@ -51,6 +51,21 @@
 - `hidden_dim=256`
 - `grid_size=16`
 
+### 3.1 `grid_size: 16` 实际含义（你问的重点）
+
+在当前代码里，`token_mode=grid` 实际走的是 `MultiScaleDenseTokenConditioner`。
+
+- 配置里的 `grid_size=16` 是 **base grid**；
+- 内部会自动派生 Pyramid Grid：`[16, 8, 4]`（`num_scales=3` 时）；
+- 每个尺度都用 `adaptive_avg_pool2d` 采样到对应网格，再展平成 token 序列。
+
+所以训练时不是“只用一个 16x16 网格”，而是会走你说的 **pyramid grid** 多尺度路径。
+
+对应代码：
+
+- `basicsr/models/color_model.py` 中把 `cond_opt.grid_size` 传给 `MultiScaleDenseTokenConditioner`；
+- `basicsr/archs/ddcolor_arch_utils/region_tokens.py` 中 `MultiScaleDenseTokenConditioner` 会把 `grid_size` 派生为多尺度 `grid_sizes`。
+
 ---
 
 ## 4. 当前版本的条件特征来源（重点）
@@ -95,6 +110,21 @@
 
 - 它不直接决定 `net_c` 是否训练；
 - `net_c` 是否更新取决于：是否进了优化器 + 是否有有效反传路径。
+
+---
+
+## 6.1 `cond_ref_mode: self` 是什么意思（你问的重点）
+
+`cond_ref_mode` 是 `LabDataset` 里的数据采样策略，决定 `ref_rgb` 从哪里来。
+
+- `cond_ref_mode: self`（或 `same/target`）时：`ref_path = gt_path`，即参考图就是当前训练样本本身；
+- `cond_ref_mode: random` 时：从数据集中随机抽另一张图作参考（尽量避开自己）。
+
+也就是说，`self` 在这里不是 Python 的 `self` 对象语义，而是“self-reference（自参考）”的配置值。
+
+对应代码：`basicsr/data/lab_dataset.py`。
+
+补充：你的训练 yml 里通常在 `datasets.train` 和 `datasets.val` 都各写一次 `cond_ref_mode`，因为它是按数据集 split 分别生效的。
 
 ---
 
