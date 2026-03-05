@@ -417,12 +417,13 @@ class ColorModel(BaseModel):
         cond_pos_per_scale = None
         if self.cond_enable and self.net_c is not None and getattr(self, 'ref_rgb', None) is not None:
             cond_opt = self.opt['train'].get('cond_opt', {})
+            # 历史命名沿用 freeze_ref_encoder；当前语义是：
+            # 参考分支特征提取（extract_condition_features）是否在 no_grad 下执行。
             freeze_ref_encoder = bool(cond_opt.get('freeze_ref_encoder', False))
             cond_gain = float(cond_opt.get('gain', 1.0))
 
-            # 从参考图特征构建条件 tokens。
-            # 说明：这里会先跑一次参考图 encoder，再对内容图跑完整 net_g。
-            # 这样做是可行的，因为 ref_feats 会立即取出并用于 net_c。
+            # 从参考图提取条件特征（当前使用 pixel decoder 三尺度特征）并构建 cond tokens。
+            # 随后对内容图执行主前向（net_g），把 cond tokens 注入 color decoder。
             if freeze_ref_encoder:
                 with torch.no_grad():
                     ref_feats = self.net_g.extract_condition_features(self.ref_rgb, use_pixel_decoder=True)
