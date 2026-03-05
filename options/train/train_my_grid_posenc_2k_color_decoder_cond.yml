@@ -29,7 +29,7 @@ datasets:
     cond_enable: true
     cond_num_regions: 6
     cond_mask_mode: none
-    cond_ref_mode: random
+    cond_ref_mode: self
     cond_subset_mode: target_only
     cond_ref_subset_mode: same_as_train
     cond_need_masks: false
@@ -145,7 +145,7 @@ train:
 
   pixel_opt:
     type: L1Loss
-    loss_weight: 0.0030
+    loss_weight: 0.0005
     reduction: mean
 
   perceptual_opt:
@@ -159,7 +159,7 @@ train:
     vgg_type: vgg16_bn
     use_input_norm: true
     range_norm: false
-    perceptual_weight: 0.10
+    perceptual_weight: 0.05
     style_weight: 0
     criterion: l1
 
@@ -193,7 +193,7 @@ train:
 
   local_ab_opt:
     enable: true
-    loss_weight: 0.010
+    loss_weight: 0.005
     reduction: mean
     focus_ratio: 0.25
     boost: 4.0
@@ -212,7 +212,7 @@ train:
 
   cond_gate_push_opt:
     enable: true
-    loss_weight: 0.5
+    loss_weight: 0.85
     target_sigmoid: 0.80
 
 val:
