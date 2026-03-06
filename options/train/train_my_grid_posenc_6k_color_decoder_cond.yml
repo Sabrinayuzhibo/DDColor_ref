@@ -1,7 +1,7 @@
-#! condB grid + pos enc: 10k train, ddcolor_artistic backbone
+#! condB grid + pos enc: 6k train, ddcolor_artistic backbone
 #! 方向B：冻结 ConvNeXt encoder，仅训练 decoder + cond gate + conditioner(net_c)
 
-name: train_my_grid_posenc_10k_color_decoder_cond_1
+name: train_my_grid_posenc_6k_color_decoder_cond
 model_type: ColorModel
 scale: 1
 num_gpu: 1
@@ -112,7 +112,7 @@ train:
     enable: true
     token_mode: grid
     num_scales: 3
-    hidden_dim: 25
+    hidden_dim: 256
     grid_size: 32
     use_scale_embed: true
     use_spatial_pos: true
@@ -137,10 +137,10 @@ train:
 
   scheduler:
     type: MultiStepLR
-    milestones: [6000, 8000]
+    milestones: [3600, 4800]
     gamma: 0.5
 
-  total_iter: 10000
+  total_iter: 6000
   warmup_iter: -1
 
   pixel_opt:
@@ -160,7 +160,7 @@ train:
     use_input_norm: true
     range_norm: false
     perceptual_weight: 0.05
-    style_weight: 5.0
+    style_weight: 0
     criterion: l1
 
   ref_style_opt:
