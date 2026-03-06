@@ -144,3 +144,4 @@ results_*/*.txt
 results/**/condition_compare.txt
 results_*/**/condition_compare.txt
 
+pretrain/
