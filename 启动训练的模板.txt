@@ -1,1 +1,1 @@
-python -m basicsr.train -opt options/train/train_my_grid_posenc_2k_color_decoder_cond.yml --launcher none
+python -m basicsr.train -opt options/train/train_my_grid_posenc_6k_color_decoder_cond_after_40k_All_trained_fine_tuned.yml --launcher none

@@ -153,6 +153,34 @@
 
 ---
 
+## 8.1 走完 `dec_layers=9` 之后输出什么，如何完成上色
+
+你现在这套 `DDColor + MultiScaleColorDecoder` 里，`dec_layers=9` 指的是
+Transformer decoder 的 9 个 block（每层包含 self-attn / image cross-attn / cond cross-attn / FFN）。
+
+9 层结束后，核心张量流是：
+
+1. 得到最终 query 表示：`output`（形状近似 `Q x B x C`，`Q=num_queries`）；
+2. 经过 `decoder_norm + color_embed(MLP)` 得到 `color_embed`（`B x Q x C`）；
+3. 与像素特征 `img_features`（`B x C x H x W`）做
+	`einsum("bqc,bchw->bqhw")`，得到 `out_feat`（`B x Q x H x W`）；
+4. 在 `DDColor.forward` 中把 `out_feat` 与输入图 `x`（3 通道）拼接：
+	`coarse_input = cat([out_feat, x], dim=1)`，通道变成 `Q+3`；
+5. 经过 `refine_net(1x1 conv)` 映射到 2 通道，输出 `output_ab`（即 Lab 空间的 AB）。
+
+训练/验证侧的最终上色在 `ColorModel` 中完成：
+
+1. `output_lab = cat([L, output_ab], dim=1)`（把输入亮度 `L` 与预测 `AB` 拼成 Lab）；
+2. `output_rgb = tensor_lab2rgb(output_lab)` 得到最终 RGB 彩图；
+3. 后续损失（pixel/perceptual/gan/ref_*）大多围绕 `output_ab` 或 `output_rgb` 计算。
+
+一句话总结：
+
+- `9` 层 decoder 本质是在学一组“颜色查询”如何从图像特征里解码出颜色基；
+- 真正的彩色图不是 decoder 直接吐出来的，而是先得 `AB`，再与原图 `L` 通道重组并转到 RGB。
+
+---
+
 ## 9. 你最关心的结论
 
 - 当前版本已经是：**参考图 -> pixel decoder 三尺度特征 -> net_c grid token -> color decoder cond cross-attn**。
