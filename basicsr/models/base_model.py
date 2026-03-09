@@ -289,8 +289,12 @@ class BaseModel():
         """
         logger = get_root_logger()
         net = self.get_bare_model(net)
+        requested_param_key = param_key
         load_net = torch.load(load_path, map_location=lambda storage, loc: storage)
+        used_encoder_subdict = False
         if param_key is not None:
+            if str(requested_param_key).lower() == 'encoder' and param_key in load_net:
+                used_encoder_subdict = True
             if param_key not in load_net and 'params' in load_net:
                 param_key = 'params'
                 logger.info('Loading: params_ema does not exist, use params.')
@@ -301,6 +305,31 @@ class BaseModel():
             if k.startswith('module.'):
                 load_net[k[7:]] = v
                 load_net.pop(k)
+
+        # Hard interception: when requested param key is 'encoder', only keep
+        # encoder-related weights to avoid silently loading decoder / heads.
+        if str(requested_param_key).lower() == 'encoder':
+            encoder_prefixes = ('encoder.',)
+            if used_encoder_subdict:
+                logger.info(
+                    'Encoder-only loading uses checkpoint["encoder"] directly; '
+                    'skip prefix filtering.'
+                )
+            else:
+                filtered = type(load_net)()
+                for k, v in load_net.items():
+                    if any((k == p[:-1]) or k.startswith(p) for p in encoder_prefixes):
+                        filtered[k] = v
+                logger.info(
+                    f"Encoder-only loading is enabled: keep {len(filtered)} / {len(load_net)} parameters."
+                )
+                if len(filtered) == 0:
+                    logger.warning(
+                        'param_key is encoder but no encoder-prefixed keys were found in checkpoint. '
+                        'No weights will be loaded for this network.'
+                    )
+                load_net = filtered
+
         self._print_different_keys_loading(net, load_net, strict)
         net.load_state_dict(load_net, strict=strict)
 

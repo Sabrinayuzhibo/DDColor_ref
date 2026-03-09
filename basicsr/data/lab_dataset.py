@@ -3,6 +3,8 @@ import random
 import time
 import numpy as np
 import torch
+from torchvision import transforms as T
+from torchvision.transforms import InterpolationMode
 from torch.utils import data as data
 
 from basicsr.data.transforms import rgb2lab
@@ -51,6 +53,31 @@ class LabDataset(data.Dataset):
         self.cond_enable = bool(opt.get('cond_enable', False))
         self.cond_ref_mode = str(opt.get('cond_ref_mode', 'random')).lower()  # random | self
 
+        # Augmented-Self Reference (Warped GT): only used for self-reconstruction
+        # reference to prevent pixel-wise shortcut learning.
+        self.self_ref_aug = T.Compose([
+            T.RandomAffine(
+                degrees=15,
+                translate=(0.1, 0.1),
+                scale=(0.8, 1.2),
+                shear=10,
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0,
+            ),
+            T.RandomPerspective(
+                distortion_scale=0.3,
+                p=0.8,
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0,
+            ),
+            T.ColorJitter(
+                brightness=0.1,
+                contrast=0.1,
+                saturation=0.1,
+                hue=0.05,
+            ),
+        ])
+
     def _load_rgb_float(self, path: str, gt_size: int):
         """Load an image from path and return RGB float32 in [0,1] resized to (gt_size, gt_size)."""
         # NOTE: Use the same file client as GT to support various backends.
@@ -60,36 +87,15 @@ class LabDataset(data.Dataset):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
 
-    def _apply_asymmetric_ref_aug(self, ref_rgb: np.ndarray) -> np.ndarray:
-        """Apply destructive geometry aug only on reference image.
+    def _apply_augmented_self_ref(self, ref_rgb: np.ndarray) -> np.ndarray:
+        """Apply Warped-GT augmentation to reference only.
 
-        Operations:
-        1) Random crop with kept area in [0.6, 0.9]
-        2) Resize back to original (W, H)
-        3) Independent random horizontal flip with p=0.5
+        Input/Output are RGB float32 numpy arrays in [0, 1], HWC.
         """
-        h, w = ref_rgb.shape[:2]
-
-        # Randomly keep 60%~90% area (crop away 10%~40%).
-        keep_area_ratio = random.uniform(0.6, 0.9)
-        keep_w = max(1, int(round(w * np.sqrt(keep_area_ratio))))
-        keep_h = max(1, int(round(h * np.sqrt(keep_area_ratio))))
-
-        if keep_w < w:
-            x0 = random.randint(0, w - keep_w)
-        else:
-            x0 = 0
-        if keep_h < h:
-            y0 = random.randint(0, h - keep_h)
-        else:
-            y0 = 0
-
-        ref_crop = ref_rgb[y0:y0 + keep_h, x0:x0 + keep_w]
-        ref_aug = cv2.resize(ref_crop, (w, h), interpolation=cv2.INTER_LINEAR)
-
-        if random.random() < 0.5:
-            ref_aug = ref_aug[:, ::-1, :]
-
+        ref_t = torch.from_numpy(np.ascontiguousarray(ref_rgb)).permute(2, 0, 1)
+        ref_t = self.self_ref_aug(ref_t)
+        ref_t = ref_t.clamp_(0.0, 1.0)
+        ref_aug = ref_t.permute(1, 2, 0).cpu().numpy().astype(np.float32)
         return np.ascontiguousarray(ref_aug)
 
 
@@ -168,10 +174,10 @@ class LabDataset(data.Dataset):
                 ref_rgb = self._load_rgb_float(ref_path, gt_size)  # RGB [0,1]
 
                 # Break diagonal identity mapping in self-reconstruction with
-                # reference-only asymmetric spatial augmentation.
+                # reference-only Warped-GT augmentation.
                 is_self_recon = (self.cond_ref_mode in ('self', 'same', 'target')) or (ref_path == gt_path)
                 if is_self_recon:
-                    ref_rgb = self._apply_asymmetric_ref_aug(ref_rgb)
+                    ref_rgb = self._apply_augmented_self_ref(ref_rgb)
             except Exception as e:
                 logger = get_root_logger()
                 logger.warning(f'Failed to load reference image: {ref_path}, fallback to self. err={e}')
