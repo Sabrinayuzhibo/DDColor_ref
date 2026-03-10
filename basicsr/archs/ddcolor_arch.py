@@ -286,6 +286,12 @@ class MultiScaleColorDecoder(nn.Module):
         self.transformer_cross_attention_layers = nn.ModuleList()
         # 额外的 cond cross-attn（对参考条件 tokens）
         self.transformer_cond_cross_attention_layers = nn.ModuleList()
+        # cond 分支：在 cond cross-attn 后补充 Add&Norm + cond self-attn
+        self.cond_dropout1 = nn.ModuleList()
+        self.cond_norm1 = nn.ModuleList()
+        self.cond_self_atten = nn.ModuleList()
+        self.cond_dropout2 = nn.ModuleList()
+        self.cond_norm2 = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
 
         for _ in range(self.num_layers):
@@ -313,6 +319,11 @@ class MultiScaleColorDecoder(nn.Module):
                     normalize_before=pre_norm,
                 )
             )
+            self.cond_dropout1.append(nn.Dropout(0.0))
+            self.cond_norm1.append(nn.LayerNorm(hidden_dim))
+            self.cond_self_atten.append(nn.MultiheadAttention(hidden_dim, nheads, dropout=0.0))
+            self.cond_dropout2.append(nn.Dropout(0.0))
+            self.cond_norm2.append(nn.LayerNorm(hidden_dim))
             self.transformer_ffn_layers.append(
                 FFNLayer(
                     d_model=hidden_dim,
@@ -382,27 +393,54 @@ class MultiScaleColorDecoder(nn.Module):
             level_index = i % self.num_feature_levels
             # 1) 先对当前尺度的条件 tokens 做 cross-attn（若提供）
             if cond_tokens_per_scale is not None:
-                assert isinstance(cond_tokens_per_scale, (list, tuple))
-                cond_tokens = cond_tokens_per_scale[level_index]
+                query_before_cond = output
+                cond_tokens = None
                 cond_pos = None
-                if cond_pos_per_scale is not None:
-                    cond_pos = cond_pos_per_scale[level_index]
 
-                gate = None
-                if self.use_cond_gate and self.cond_gate_logit is not None:
-                    # 按尺度取 gate：同一尺度的 cond token 使用相同的 gate
-                    # 标量 gate，形状 (1,)，广播到 (S, N, C)
-                    gate = torch.sigmoid(self.cond_gate_logit[level_index]).view(1, 1, 1)
+                if isinstance(cond_tokens_per_scale, (list, tuple)):
+                    cond_tokens = cond_tokens_per_scale[level_index]
+                    if cond_pos_per_scale is not None:
+                        cond_pos = cond_pos_per_scale[level_index]
+                elif torch.is_tensor(cond_tokens_per_scale):
+                    # Flatten+Concat mode: cond tokens are (B, N_total, C).
+                    # Convert to MHA memory layout (N_total, B, C).
+                    if cond_tokens_per_scale.dim() != 3:
+                        raise ValueError(
+                            f'Expected cond tokens with 3 dims, got shape={tuple(cond_tokens_per_scale.shape)}'
+                        )
+                    cond_tokens = cond_tokens_per_scale.transpose(0, 1).contiguous()
+                    if cond_pos_per_scale is not None:
+                        if not torch.is_tensor(cond_pos_per_scale) or cond_pos_per_scale.dim() != 3:
+                            raise ValueError('cond_pos in flatten mode must be a 3D tensor or None.')
+                        cond_pos = cond_pos_per_scale.transpose(0, 1).contiguous()
+                else:
+                    raise TypeError('cond_tokens_per_scale must be list/tuple or tensor.')
 
-                output = self.transformer_cond_cross_attention_layers[i](
+                # 阶段 1：Reference Cross-Attention
+                cond_out = self.transformer_cond_cross_attention_layers[i](
                     output,
                     cond_tokens,
                     memory_mask=None,
                     memory_key_padding_mask=None,
                     pos=cond_pos,
                     query_pos=query_embed,
-                    gate=gate,
+                    gate=None,
+                    return_attn_only=True,
                 )
+
+                # 阶段 2：Add & Norm 1（融合 cond_gate）
+                gate_val = 1.0
+                if self.use_cond_gate and self.cond_gate_logit is not None:
+                    gate_val = torch.sigmoid(self.cond_gate_logit[level_index]).view(1, 1, 1)
+                output = query_before_cond + gate_val * self.cond_dropout1[i](cond_out)
+                output = self.cond_norm1[i](output)
+
+                # 阶段 3：Condition Self-Attention（Query 间统筹）
+                q = output + query_embed
+                k = output + query_embed
+                cond_self_out = self.cond_self_atten[i](q, k, output)[0]
+                output = output + self.cond_dropout2[i](cond_self_out)
+                output = self.cond_norm2[i](output)
 
             # 2) 再对当前尺度图像特征做原始 cross-attn
             output = self.transformer_cross_attention_layers[i](

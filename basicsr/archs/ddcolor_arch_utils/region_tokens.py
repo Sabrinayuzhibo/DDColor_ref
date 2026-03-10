@@ -4,6 +4,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from basicsr.archs.ddcolor_arch_utils.position_encoding import PositionEmbeddingSine
 
 
 Tensor = torch.Tensor
@@ -259,6 +260,76 @@ class MultiScaleDenseTokenConditioner(nn.Module):
         # 直接返回按尺度拆分的列表形式，方便与 MultiScaleColorDecoder
         # 的多尺度 cross-attn 接口对接。
         return cond_tokens_per_scale, cond_pos_per_scale
+
+
+class MultiScaleFlattenTokenConditioner(nn.Module):
+    """DDColor/Deformable-DETR style multiscale flatten + concat conditioner.
+
+    Input:
+        ref_feats: List[Tensor], each is (B, C_i, H_i, W_i)
+    Output:
+        condition_tokens: (B, N_total, hidden_dim)
+    """
+
+    def __init__(
+        self,
+        num_scales: int = 3,
+        hidden_dim: int = 256,
+    ) -> None:
+        super().__init__()
+        self.num_scales = int(num_scales)
+        self.hidden_dim = int(hidden_dim)
+
+        # Lazily built on first forward from actual feature channels.
+        self.input_proj: Optional[nn.ModuleList] = None
+
+        # Per-level embedding and standard 2D sine positional encoding.
+        self.level_embed = nn.Embedding(self.num_scales, self.hidden_dim)
+        self.pos_embed = PositionEmbeddingSine(self.hidden_dim // 2, normalize=True)
+
+    def _build_input_proj(self, ref_feats: List[Tensor]) -> None:
+        assert len(ref_feats) >= self.num_scales
+        projs = []
+        for k in range(self.num_scales):
+            c_in = int(ref_feats[k].shape[1])
+            conv = nn.Conv2d(c_in, self.hidden_dim, kernel_size=1)
+            nn.init.kaiming_uniform_(conv.weight, a=1.0)
+            if conv.bias is not None:
+                nn.init.constant_(conv.bias, 0.0)
+            conv = conv.to(device=ref_feats[k].device)
+            projs.append(conv)
+        self.input_proj = nn.ModuleList(projs)
+
+    def forward(self, ref_feats: List[Tensor], masks: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
+        del masks  # Flatten mode does not use masks.
+        assert isinstance(ref_feats, (list, tuple)) and len(ref_feats) >= self.num_scales
+        feats = list(ref_feats[: self.num_scales])
+
+        if self.input_proj is None:
+            self._build_input_proj(feats)
+        assert self.input_proj is not None
+
+        flattened_tokens: List[Tensor] = []
+
+        for i, feat in enumerate(feats):
+            # (B, hidden_dim, H, W)
+            src = self.input_proj[i](feat)
+            # (B, hidden_dim, H, W)
+            pos = self.pos_embed(src)
+
+            # (B, H*W, hidden_dim)
+            src = src.flatten(2).transpose(1, 2).contiguous()
+            # (B, H*W, hidden_dim)
+            pos = pos.flatten(2).transpose(1, 2).contiguous()
+
+            # (1, 1, hidden_dim)
+            lvl = self.level_embed.weight[i].view(1, 1, -1).to(device=src.device, dtype=src.dtype)
+            token_seq = src + pos + lvl
+            flattened_tokens.append(token_seq)
+
+        # (B, N_total, hidden_dim)
+        condition_tokens = torch.cat(flattened_tokens, dim=1)
+        return condition_tokens, None
 
 
 class MultiScaleRegionTokenConditioner(nn.Module):

@@ -7,7 +7,12 @@ from tqdm import tqdm
 import numpy as np
 
 from basicsr.archs import build_network
-from basicsr.archs.ddcolor_arch_utils.region_tokens import MultiScaleDenseTokenConditioner, MultiScaleRegionTokenConditioner, RegionTokenSpec
+from basicsr.archs.ddcolor_arch_utils.region_tokens import (
+    MultiScaleDenseTokenConditioner,
+    MultiScaleFlattenTokenConditioner,
+    MultiScaleRegionTokenConditioner,
+    RegionTokenSpec,
+)
 from basicsr.losses import build_loss
 from basicsr.metrics import calculate_metric
 from basicsr.utils import get_root_logger, imwrite, tensor2img
@@ -77,6 +82,11 @@ class ColorModel(BaseModel):
                     num_scales=num_scales,
                     hidden_dim=hidden_dim,
                     grid_size=grid_size,
+                )
+            elif token_mode in ('multiscale_flatten', 'flatten'):
+                self.net_c = MultiScaleFlattenTokenConditioner(
+                    num_scales=num_scales,
+                    hidden_dim=hidden_dim,
                 )
             elif token_mode in ('region', 'mask'):
                 self.net_c = MultiScaleRegionTokenConditioner(
@@ -432,7 +442,10 @@ class ColorModel(BaseModel):
 
             cond_tokens_per_scale, cond_pos_per_scale = self.net_c(ref_feats)
             if cond_gain != 1.0 and cond_tokens_per_scale is not None:
-                cond_tokens_per_scale = [t * cond_gain for t in cond_tokens_per_scale]
+                if isinstance(cond_tokens_per_scale, (list, tuple)):
+                    cond_tokens_per_scale = [t * cond_gain for t in cond_tokens_per_scale]
+                else:
+                    cond_tokens_per_scale = cond_tokens_per_scale * cond_gain
         
         # 前向：可选注入条件 tokens（DDColor 支持 cond_tokens/cond_pos 别名）
         self.output_ab = self.net_g(self.lq_rgb, cond_tokens=cond_tokens_per_scale, cond_pos=cond_pos_per_scale)

@@ -110,15 +110,12 @@ train:
 
   cond_opt:
     enable: true
-    token_mode: grid
+    token_mode: multiscale_flatten
     num_scales: 3
     hidden_dim: 256
-    grid_size: 32
     use_scale_embed: true
     use_spatial_pos: true
-    spatial_pos_type: learnable
-    include_area_frac: true
-    # encoder 已冻结，这里也走 no_grad，减少显存与计算
+    spatial_pos_type: sine
     freeze_ref_encoder: false
 
   color_enhance: True
