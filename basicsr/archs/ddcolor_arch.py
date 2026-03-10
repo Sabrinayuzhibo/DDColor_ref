@@ -6,6 +6,7 @@ from basicsr.archs.ddcolor_arch_utils.convnext import ConvNeXt
 from basicsr.archs.ddcolor_arch_utils.transformer_utils import SelfAttentionLayer, CrossAttentionLayer, FFNLayer, MLP
 from basicsr.archs.ddcolor_arch_utils.position_encoding import PositionEmbeddingSine
 from basicsr.archs.ddcolor_arch_utils.transformer import Transformer
+from basicsr.utils import get_root_logger
 from basicsr.utils.registry import ARCH_REGISTRY
 
 
@@ -369,6 +370,9 @@ class MultiScaleColorDecoder(nn.Module):
         # 输出 FFN
         self.color_embed = MLP(hidden_dim, hidden_dim, color_embed_dim, 3)
 
+        # Debug flag: log cond branch statistics only once.
+        self._cond_debug_logged = False
+
     def forward(self, x, img_features, cond_tokens_per_scale=None, cond_pos_per_scale=None):
         # x 是多尺度特征列表
         assert len(x) == self.num_feature_levels
@@ -441,6 +445,32 @@ class MultiScaleColorDecoder(nn.Module):
                 cond_self_out = self.cond_self_atten[i](q, k, output)[0]
                 output = output + self.cond_dropout2[i](cond_self_out)
                 output = self.cond_norm2[i](output)
+
+                # One-time runtime sanity check for condition branch statistics.
+                if (not self._cond_debug_logged) and i == 0:
+                    with torch.no_grad():
+                        logger = get_root_logger()
+                        cond_out_d = cond_out.detach()
+                        cond_self_d = cond_self_out.detach()
+                        logger.info(
+                            '[CondDebug] level=%d cond_out shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f',
+                            level_index,
+                            tuple(cond_out_d.shape),
+                            float(cond_out_d.mean().item()),
+                            float(cond_out_d.std(unbiased=False).item()),
+                            float(cond_out_d.min().item()),
+                            float(cond_out_d.max().item()),
+                        )
+                        logger.info(
+                            '[CondDebug] level=%d cond_self_out shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f',
+                            level_index,
+                            tuple(cond_self_d.shape),
+                            float(cond_self_d.mean().item()),
+                            float(cond_self_d.std(unbiased=False).item()),
+                            float(cond_self_d.min().item()),
+                            float(cond_self_d.max().item()),
+                        )
+                    self._cond_debug_logged = True
 
             # 2) 再对当前尺度图像特征做原始 cross-attn
             output = self.transformer_cross_attention_layers[i](
