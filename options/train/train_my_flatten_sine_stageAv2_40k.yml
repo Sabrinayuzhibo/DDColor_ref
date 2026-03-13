@@ -1,7 +1,7 @@
-#! condB grid + pos enc: 384-res 2k hard-ref train from scratch, ddcolor_artistic backbone
-#! 方向B：冻结 ConvNeXt encoder，仅训练 color decoder(+cond gate) + conditioner(net_c)
+#! condB grid + pos enc: 40k train, ddcolor_artistic backbone
+#! satgeAv2只用预训练模型来初始化backbone然后其他的全部都是随机初始化的
 
-name: train_ddcolor_condB_p1_grid_posenc_384_2k_artist_color_decoder_cond_style15_local_guide_hardref_fixwarmup
+name: train_my_flatten_sine_stageAv2_40k
 model_type: ColorModel
 scale: 1
 num_gpu: 1
@@ -17,7 +17,7 @@ datasets:
     io_backend:
       type: disk
 
-    gt_size: 384
+    gt_size: 256
     use_hflip: True
     use_rot: False
 
@@ -29,14 +29,14 @@ datasets:
     cond_enable: true
     cond_num_regions: 6
     cond_mask_mode: none
-    cond_ref_mode: random
+    cond_ref_mode: self
     cond_subset_mode: target_only
     cond_ref_subset_mode: same_as_train
     cond_need_masks: false
 
     use_shuffle: true
-    num_worker_per_gpu: 16
-    batch_size_per_gpu: 6
+    num_worker_per_gpu: 12
+    batch_size_per_gpu: 8
     dataset_enlarge_ratio: 1
     pin_memory: true
     persistent_workers: true
@@ -50,7 +50,7 @@ datasets:
     io_backend:
       type: disk
 
-    gt_size: 384
+    gt_size: 512
     use_hflip: False
     use_rot: False
 
@@ -82,7 +82,7 @@ network_g:
   num_scales: 3
   dec_layers: 9
   use_cond_gate: true
-  cond_gate_init: -1.2
+  cond_gate_init: 0.5
   last_norm: Spectral
   num_output_channels: 2
   do_normalize: False
@@ -93,8 +93,9 @@ network_d:
   n_channels: 3
 
 path:
+  # 使用现有 artist 预训练权重，仅加载 encoder.* 到 backbone
   pretrain_network_g: /root/autodl-tmp/ddcolor/pretrain/ddcolor_artist/pytorch_model.bin
-  param_key_g: ~
+  param_key_g: encoder
   pretrain_network_d: ~
   pretrain_network_c: ~
   strict_load_g: false
@@ -103,48 +104,46 @@ path:
   resume_state: ~
 
 train:
+  # ✅ 彻底冻结 ConvNeXt 骨干，保护学霸的眼睛！只训练 Pixel Decoder + Color Decoder + net_c
   train_only_cond: false
-  train_decoder_cond: false
-  train_color_decoder_cond: true
+  train_decoder_cond: true
+  train_color_decoder_cond: false
 
   cond_opt:
     enable: true
-    token_mode: grid
+    token_mode: multiscale_flatten
     num_scales: 3
     hidden_dim: 256
-    grid_size: 16
     use_scale_embed: true
     use_spatial_pos: true
-    spatial_pos_type: learnable
-    include_area_frac: true
-    freeze_ref_encoder: true
-    gain: 1.20
+    spatial_pos_type: sine
+    freeze_ref_encoder: true  # ✅ 冻结参考图特征提取过程，节省大量显存
 
   color_enhance: True
-  color_enhance_factor: 1.08
+  color_enhance_factor: 1.3
 
   optim_g:
     type: AdamW
-    lr: !!float 8.0e-6
+    lr: !!float 5.0e-5  # ✅ 稍微降低学习率，让 Transformer 从零开始学得更平稳
     weight_decay: 0.01
     betas: [0.9, 0.99]
   optim_d:
     type: Adam
-    lr: !!float 6.0e-6
+    lr: !!float 1.0e-5
     weight_decay: 0
     betas: [0.9, 0.99]
 
   scheduler:
     type: MultiStepLR
-    milestones: [1200, 1700]
+    milestones: [20000, 30000]
     gamma: 0.5
 
-  total_iter: 2000
+  total_iter: 40000
   warmup_iter: -1
 
   pixel_opt:
     type: L1Loss
-    loss_weight: 0.0025
+    loss_weight: 1.0
     reduction: mean
 
   perceptual_opt:
@@ -158,7 +157,7 @@ train:
     vgg_type: vgg16_bn
     use_input_norm: true
     range_norm: false
-    perceptual_weight: 0.08
+    perceptual_weight: 1.0
     style_weight: 0
     criterion: l1
 
@@ -174,52 +173,42 @@ train:
     use_input_norm: true
     range_norm: false
     perceptual_weight: 0.0
-    style_weight: 2.5
+    style_weight: 0.0
     criterion: l1
 
   ref_moment_opt:
-    enable: true
-    loss_weight: 0.18
-    use_std: true
-
-  ref_cov_opt:
-    enable: true
-    loss_weight: 0.10
+    enable: false
 
   ref_contrast_opt:
     enable: true
-    loss_weight: 0.10
-    margin: 0.10
+    loss_weight: 0.5
+    margin: 0.5
     use_std: true
-    hard_negative: true
 
   local_ab_opt:
-    enable: true
-    loss_weight: 0.012
-    reduction: mean
-    focus_ratio: 0.25
-    boost: 4.0
-    edge_power: 1.0
+    enable: false
 
+  # ✅ 重新引入 GAN，逼迫模型走出灰色安全区，生成高饱和度色彩
   gan_opt:
     type: GANLoss
     gan_type: vanilla
     real_label_val: 1.0
     fake_label_val: 0.0
-    loss_weight: 0.18
+    loss_weight: 0.15
 
+  # ✅ 重新引入 Colorfulness，惩罚灰褐色
   colorfulness_opt:
     type: ColorfulnessLoss
-    loss_weight: 0.010
+    loss_weight: 0.2
 
   cond_gate_push_opt:
     enable: true
-    loss_weight: 0.25
-    target_sigmoid: 0.65
+    loss_weight: 0.5
+    target_sigmoid: 0.80
 
 val:
-  val_freq: !!float 500
-  save_img: false
+  val_freq: !!float 2000
+  save_img: true
   pbar: false
   suffix: ~
   metrics: {}
@@ -228,7 +217,7 @@ logger:
   print_freq: 100
   save_snapshot_freq: ~
   save_snapshot_verbose: false
-  save_checkpoint_freq: !!float 500
+  save_checkpoint_freq: !!float 5000
   use_tb_logger: true
   wandb:
     project: ~

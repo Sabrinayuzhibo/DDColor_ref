@@ -293,12 +293,23 @@ class BaseModel():
         load_net = torch.load(load_path, map_location=lambda storage, loc: storage)
         used_encoder_subdict = False
         if param_key is not None:
-            if str(requested_param_key).lower() == 'encoder' and param_key in load_net:
-                used_encoder_subdict = True
-            if param_key not in load_net and 'params' in load_net:
-                param_key = 'params'
-                logger.info('Loading: params_ema does not exist, use params.')
-            load_net = load_net[param_key]
+            # Encoder-only mode supports two checkpoint formats:
+            # 1) top-level key "encoder" exists -> use that sub-dict directly;
+            # 2) raw root state_dict -> keep root first, then filter by prefix below.
+            if str(requested_param_key).lower() == 'encoder':
+                if param_key in load_net:
+                    used_encoder_subdict = True
+                    load_net = load_net[param_key]
+                else:
+                    logger.info(
+                        'Encoder-only loading: checkpoint has no top-level "encoder" key; '
+                        'use root state_dict then filter encoder-prefixed params.'
+                    )
+            else:
+                if param_key not in load_net and 'params' in load_net:
+                    param_key = 'params'
+                    logger.info('Loading: params_ema does not exist, use params.')
+                load_net = load_net[param_key]
         logger.info(f'Loading {net.__class__.__name__} model from {load_path}, with param key: [{param_key}].')
         # remove unnecessary 'module.'
         for k, v in deepcopy(load_net).items():
