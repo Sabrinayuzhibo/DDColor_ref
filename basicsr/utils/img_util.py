@@ -149,8 +149,22 @@ def imwrite(img, file_path, params=None, auto_mkdir=True):
         dir_name = os.path.abspath(os.path.dirname(file_path))
         os.makedirs(dir_name, exist_ok=True)
     ok = cv2.imwrite(file_path, img, params)
-    if not ok:
-        raise IOError('Failed in writing images.')
+    if ok:
+        return
+
+    # Fallback for Windows/unicode paths where cv2.imwrite may fail.
+    ext = os.path.splitext(file_path)[1]
+    if not ext:
+        ext = '.png'
+    encode_ok, buffer = cv2.imencode(ext, img, params if params is not None else [])
+    if encode_ok:
+        try:
+            buffer.tofile(file_path)
+            return
+        except Exception:
+            pass
+
+    raise IOError('Failed in writing images.')
 
 
 def crop_border(imgs, crop_border):

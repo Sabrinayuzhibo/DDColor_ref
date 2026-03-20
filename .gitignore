@@ -146,3 +146,4 @@ results_*/**/condition_compare.txt
 
 pretrain/
 train_*/
+hf_cache

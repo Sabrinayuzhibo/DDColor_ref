@@ -92,7 +92,8 @@ def parse_options(root_path, is_train=True):
     args = parser.parse_args()
 
     # parse yml to dict
-    with open(args.opt, mode='r') as f:
+    # Always read option YAML as UTF-8 to avoid Windows locale decoding issues.
+    with open(args.opt, mode='r', encoding='utf-8-sig') as f:
         opt = yaml.load(f, Loader=ordered_yaml()[0])
 
     # distributed settings
@@ -189,7 +190,7 @@ def copy_opt_file(opt_file, experiments_root):
     filename = osp.join(experiments_root, osp.basename(opt_file))
     copyfile(opt_file, filename)
 
-    with open(filename, 'r+') as f:
+    with open(filename, 'r+', encoding='utf-8') as f:
         lines = f.readlines()
         lines.insert(0, f'# GENERATE TIME: {time.asctime()}\n# CMD:\n# {cmd}\n\n')
         f.seek(0)

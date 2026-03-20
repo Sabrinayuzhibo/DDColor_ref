@@ -33,7 +33,8 @@ class LabDataset(data.Dataset):
             meta_info_file = [meta_info_file]
         self.paths = []
         for meta_info in meta_info_file:
-            with open(meta_info, 'r') as fin:
+            # Read meta list in UTF-8 to avoid Windows default GBK decode errors.
+            with open(meta_info, 'r', encoding='utf-8-sig') as fin:
                 self.paths.extend([line.strip() for line in fin])
 
         self.min_ab, self.max_ab = -128, 128

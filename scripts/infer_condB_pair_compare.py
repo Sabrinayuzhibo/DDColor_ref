@@ -42,6 +42,7 @@ if _project_root not in sys.path:
 from ddcolor import DDColor, build_ddcolor_model  # noqa: E402
 from basicsr.archs.ddcolor_arch_utils.region_tokens import (  # noqa: E402
     MultiScaleDenseTokenConditioner,
+    MultiScaleFlattenTokenConditioner,
 )
 
 
@@ -251,7 +252,12 @@ def _build_cond_from_reference(
     cond_tokens_per_scale, cond_pos_per_scale = conditioner(ref_feats)
     if cond_gain != 1.0 and cond_tokens_per_scale is not None:
         g = float(cond_gain)
-        cond_tokens_per_scale = [t * g for t in cond_tokens_per_scale]
+        if isinstance(cond_tokens_per_scale, (list, tuple)):
+            cond_tokens_per_scale = [t * g for t in cond_tokens_per_scale]
+        elif torch.is_tensor(cond_tokens_per_scale):
+            cond_tokens_per_scale = cond_tokens_per_scale * g
+        else:
+            raise TypeError("Unsupported cond token container type.")
     return cond_tokens_per_scale, cond_pos_per_scale
 
 
@@ -288,6 +294,41 @@ def _compare_condition_tokens(cond_a, cond_b):
     """比较两组 cond_tokens_per_scale 的差异，返回 per-scale 统计信息和文本结论。"""
     if cond_a is None or cond_b is None:
         return {}, "cond tokens 缺失，无法比较。"
+
+    # flatten mode: tensor (B, N, C)
+    if torch.is_tensor(cond_a) and torch.is_tensor(cond_b):
+        if cond_a.dim() == 2:
+            cond_a = cond_a.unsqueeze(0)
+        if cond_b.dim() == 2:
+            cond_b = cond_b.unsqueeze(0)
+        if cond_a.shape != cond_b.shape:
+            return {
+                "flatten": {
+                    "error": f"shape mismatch: {tuple(cond_a.shape)} vs {tuple(cond_b.shape)}"
+                }
+            }, "flatten cond tokens 形状不一致，无法比较。"
+
+        diff = (cond_a - cond_b).pow(2).mean().sqrt().item()
+        na = cond_a.pow(2).mean().sqrt().item()
+        nb = cond_b.pow(2).mean().sqrt().item()
+        avg_norm = 0.5 * (na + nb)
+        mean_rel = float(diff / max(avg_norm, 1e-8))
+
+        stats = {
+            "flatten": {
+                "rms_diff": float(diff),
+                "norm_a": float(na),
+                "norm_b": float(nb),
+                "avg_norm": float(avg_norm),
+            }
+        }
+        if mean_rel < 0.05:
+            summary = f"两次条件 tokens 差异相对范数约 {mean_rel:.4f}，整体偏小，可能参考语义几乎未区分。"
+        elif mean_rel > 0.8:
+            summary = f"两次条件 tokens 差异相对范数约 {mean_rel:.4f}，非常大，可能导致风格/色彩分布强烈偏移。"
+        else:
+            summary = f"两次条件 tokens 差异相对范数约 {mean_rel:.4f}，处于中等区间。"
+        return stats, summary
 
     if not isinstance(cond_a, (list, tuple)) or not isinstance(cond_b, (list, tuple)):
         return {}, "内部格式异常：cond tokens 不是 list/tuple。"
@@ -421,6 +462,12 @@ def _aggressive_postprocess_ab_pair(
 
 
 def _cond_tokens_rms(tokens_per_scale):
+    if torch.is_tensor(tokens_per_scale):
+        t = tokens_per_scale
+        if t.dim() == 2:
+            t = t.unsqueeze(0)
+        return [float(t.pow(2).mean().sqrt().item())]
+
     vals = []
     for t in tokens_per_scale:
         vals.append(float(t.pow(2).mean().sqrt().item()))
@@ -428,6 +475,16 @@ def _cond_tokens_rms(tokens_per_scale):
 
 
 def _normalize_cond_tokens_rms(tokens_per_scale, target_rms: float):
+    if torch.is_tensor(tokens_per_scale):
+        t = tokens_per_scale
+        if t.dim() == 2:
+            t = t.unsqueeze(0)
+        eps = 1e-8
+        tgt = float(target_rms)
+        cur = t.pow(2).mean().sqrt()
+        scale = tgt / (cur + eps)
+        return t * scale
+
     out = []
     eps = 1e-8
     tgt = float(target_rms)
@@ -439,6 +496,13 @@ def _normalize_cond_tokens_rms(tokens_per_scale, target_rms: float):
 
 
 def _center_cond_tokens(tokens_per_scale):
+    if torch.is_tensor(tokens_per_scale):
+        t = tokens_per_scale
+        if t.dim() == 2:
+            t = t.unsqueeze(0)
+        # flatten shape: (B, N, C), center over token dimension N
+        return t - t.mean(dim=1, keepdim=True)
+
     # token shape: (S_k, B, C), center over token dimension S_k
     return [t - t.mean(dim=0, keepdim=True) for t in tokens_per_scale]
 
@@ -447,6 +511,12 @@ def _contrast_boost_pair(cond1_tokens, cond2_tokens, boost: float):
     b = float(boost)
     if b <= 0:
         return cond1_tokens, cond2_tokens
+
+    if torch.is_tensor(cond1_tokens) and torch.is_tensor(cond2_tokens):
+        t1 = cond1_tokens.unsqueeze(0) if cond1_tokens.dim() == 2 else cond1_tokens
+        t2 = cond2_tokens.unsqueeze(0) if cond2_tokens.dim() == 2 else cond2_tokens
+        delta = t1 - t2
+        return t1 + b * delta, t2 - b * delta
 
     out1 = []
     out2 = []
@@ -500,6 +570,17 @@ def main():
     parser.add_argument("--model_size", default="large", choices=["tiny", "large"])
     parser.add_argument("--num_queries", default=256, type=int)
     parser.add_argument("--num_scales", default=3, type=int)
+    parser.add_argument(
+        "--cond_token_mode",
+        default="dense",
+        choices=["dense", "flatten"],
+        help=(
+            "Conditioner token mode. "
+            "dense=grid conditioner (needs --grid_size), "
+            "flatten=non-grid flattened conditioner."
+        ),
+    )
+    parser.add_argument("--cond_hidden_dim", default=256, type=int, help="Conditioner hidden dim")
     parser.add_argument("--grid_size", default=16, type=int)
     parser.add_argument("--dec_layers", default=9, type=int)
     parser.add_argument("--cond_gain1", default=1.0, type=float, help="Gain for first reference conditioner")
@@ -593,12 +674,26 @@ def main():
     _maybe_override_cond_gate(model, args.override_cond_gate_raw)
     _print_cond_gate(model)
 
-    # 与训练配置一致的 dense/grid conditioner
-    conditioner = MultiScaleDenseTokenConditioner(
-        num_scales=args.num_scales,
-        hidden_dim=256,
-        grid_size=args.grid_size,
-    ).to(device)
+    # 与训练配置一致的 conditioner（dense/grid 或 flatten/non-grid）
+    if args.cond_token_mode == "flatten":
+        conditioner = MultiScaleFlattenTokenConditioner(
+            num_scales=args.num_scales,
+            hidden_dim=args.cond_hidden_dim,
+        ).to(device)
+        print(
+            f"[INFO] conditioner mode=flatten, num_scales={args.num_scales}, "
+            f"hidden_dim={args.cond_hidden_dim}"
+        )
+    else:
+        conditioner = MultiScaleDenseTokenConditioner(
+            num_scales=args.num_scales,
+            hidden_dim=args.cond_hidden_dim,
+            grid_size=args.grid_size,
+        ).to(device)
+        print(
+            f"[INFO] conditioner mode=dense, num_scales={args.num_scales}, "
+            f"hidden_dim={args.cond_hidden_dim}, grid_size={args.grid_size}"
+        )
     conditioner.eval()
 
     content_list = _list_images(args.content)

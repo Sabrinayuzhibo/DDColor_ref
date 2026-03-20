@@ -182,7 +182,8 @@ def paired_paths_from_meta_info_file(folders, keys, meta_info_file, filename_tmp
     input_folder, gt_folder = folders
     input_key, gt_key = keys
 
-    with open(meta_info_file, 'r') as fin:
+    # Read meta list in UTF-8 to avoid Windows default GBK decode errors.
+    with open(meta_info_file, 'r', encoding='utf-8-sig') as fin:
         gt_names = [line.split(' ')[0] for line in fin]
 
     paths = []

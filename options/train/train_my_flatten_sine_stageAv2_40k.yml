@@ -35,8 +35,8 @@ datasets:
     cond_need_masks: false
 
     use_shuffle: true
-    num_worker_per_gpu: 12
-    batch_size_per_gpu: 8
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 2
     dataset_enlarge_ratio: 1
     pin_memory: true
     persistent_workers: true
@@ -94,7 +94,7 @@ network_d:
 
 path:
   # 使用现有 artist 预训练权重，仅加载 encoder.* 到 backbone
-  pretrain_network_g: /root/autodl-tmp/ddcolor/pretrain/ddcolor_artist/pytorch_model.bin
+  pretrain_network_g: pretrain/ddcolor_artist/pytorch_model.bin
   param_key_g: encoder
   pretrain_network_d: ~
   pretrain_network_c: ~
@@ -119,8 +119,9 @@ train:
     spatial_pos_type: sine
     freeze_ref_encoder: true  # ✅ 冻结参考图特征提取过程，节省大量显存
 
-  color_enhance: True
-  color_enhance_factor: 1.3
+  # 强监督阶段：关闭颜色增强，避免监督目标被二次偏移
+  color_enhance: False
+  color_enhance_factor: 1.0
 
   optim_g:
     type: AdamW
@@ -143,7 +144,7 @@ train:
 
   pixel_opt:
     type: L1Loss
-    loss_weight: 1.0
+    loss_weight: 2.0
     reduction: mean
 
   perceptual_opt:
@@ -157,7 +158,7 @@ train:
     vgg_type: vgg16_bn
     use_input_norm: true
     range_norm: false
-    perceptual_weight: 1.0
+    perceptual_weight: 1.2
     style_weight: 0
     criterion: l1
 
@@ -172,39 +173,41 @@ train:
     vgg_type: vgg16_bn
     use_input_norm: true
     range_norm: false
-    perceptual_weight: 0.0
-    style_weight: 0.0
+    perceptual_weight: 0.2
+    style_weight: 0.05
     criterion: l1
 
   ref_moment_opt:
-    enable: false
+    enable: true
+    loss_weight: 0.0
+    use_std: true
 
   ref_contrast_opt:
-    enable: true
-    loss_weight: 0.5
+    enable: false
+    loss_weight: 0.0
     margin: 0.5
     use_std: true
 
   local_ab_opt:
     enable: false
 
-  # ✅ 重新引入 GAN，逼迫模型走出灰色安全区，生成高饱和度色彩
+  # ✅ 对抗项降权，避免压过重建监督
   gan_opt:
     type: GANLoss
     gan_type: vanilla
     real_label_val: 1.0
     fake_label_val: 0.0
-    loss_weight: 0.15
+    loss_weight: 0.01
 
-  # ✅ 重新引入 Colorfulness，惩罚灰褐色
+  # ✅ 色彩先做轻约束，避免过度饱和
   colorfulness_opt:
     type: ColorfulnessLoss
-    loss_weight: 0.2
+    loss_weight: 0.03
 
   cond_gate_push_opt:
     enable: true
-    loss_weight: 0.5
-    target_sigmoid: 0.80
+    loss_weight: 0.03
+    target_sigmoid: 0.55
 
 val:
   val_freq: !!float 2000

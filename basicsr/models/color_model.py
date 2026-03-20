@@ -1,4 +1,6 @@
 import os
+import re
+import hashlib
 import torch
 import itertools
 from collections import OrderedDict
@@ -36,6 +38,26 @@ except Exception:  # pragma: no cover
     get_activations = None
     calculate_activation_statistics = None
     calculate_frechet_distance = None
+
+
+def _safe_path_name(name: str, max_len: int = 80) -> str:
+    """Make a filesystem-safe path component (especially for Windows)."""
+    raw = str(name)
+    # Keep path segments ASCII-only to avoid Windows cv2.imwrite unicode path issues.
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', raw)
+    safe = re.sub(r'_+', '_', safe)
+    safe = safe.strip().rstrip('.')
+    if not safe:
+        safe = 'unnamed'
+    if len(safe) > max_len:
+        digest = hashlib.md5(raw.encode('utf-8', errors='ignore')).hexdigest()[:8]
+        safe = f'{safe[:max_len-9]}_{digest}'
+    return safe
+
+
+def _safe_log_text(text) -> str:
+    """Make log text safe for non-UTF8 consoles (e.g. Windows GBK)."""
+    return str(text).encode('ascii', errors='backslashreplace').decode('ascii')
 
 
 @MODEL_REGISTRY.register()
@@ -641,6 +663,7 @@ class ColorModel(BaseModel):
             # if idx == 100:
             #     break
             img_name = osp.splitext(osp.basename(val_data['lq_path'][0]))[0]
+            safe_img_name = _safe_path_name(img_name)
             if hasattr(self, 'gt'):
                 del self.gt
             self.feed_data(val_data)
@@ -657,18 +680,27 @@ class ColorModel(BaseModel):
 
             if save_img:
                 if self.opt['is_train']:
-                    save_dir = osp.join(self.opt['path']['visualization'], img_name)
+                    save_dir = osp.join(self.opt['path']['visualization'], safe_img_name)
+                    logger = get_root_logger()
                     for key in visuals:
                         save_path = os.path.join(save_dir, '{}_{}.png'.format(current_iter, key))
-                        img = tensor2img(visuals[key])
-                        imwrite(img, save_path)
+                        try:
+                            img = tensor2img(visuals[key])
+                            imwrite(img, save_path)
+                        except Exception as e:
+                            logger.warning(
+                                'Skip saving visualization key=%s, path=%s, reason: %s',
+                                _safe_log_text(key),
+                                _safe_log_text(save_path),
+                                _safe_log_text(e),
+                            )
                 else:
                     if self.opt['val']['suffix']:
                         save_img_path = osp.join(self.opt['path']['visualization'], dataset_name,
-                                                 f'{img_name}_{self.opt["val"]["suffix"]}.png')
+                                                 f'{safe_img_name}_{self.opt["val"]["suffix"]}.png')
                     else:
                         save_img_path = osp.join(self.opt['path']['visualization'], dataset_name,
-                                                 f'{img_name}_{self.opt["name"]}.png')
+                                                 f'{safe_img_name}_{self.opt["name"]}.png')
                     imwrite(sr_img, save_img_path)
 
             if with_metrics:
