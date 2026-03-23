@@ -206,7 +206,12 @@ class LabDataset(data.Dataset):
         if self.cond_enable:
             # Keep ref in RGB [0,1] float32 tensor (C,H,W)
             ref_rgb_t = img2tensor([ref_rgb], bgr2rgb=False, float32=True)[0]
+            # Also expose ref L channel so ref can follow the same encoder-input
+            # logic as lq (L + zero ab -> pseudo RGB) when needed.
+            ref_l, _ = rgb2lab(ref_rgb)
+            ref_l_t = img2tensor([ref_l], bgr2rgb=False, float32=True)[0]
             return_d['ref_rgb'] = ref_rgb_t
+            return_d['ref_l'] = ref_l_t
             return_d['ref_path'] = ref_path
         return return_d
 

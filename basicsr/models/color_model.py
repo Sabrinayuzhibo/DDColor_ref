@@ -307,6 +307,7 @@ class ColorModel(BaseModel):
     def feed_data(self, data):
         self.lq = data['lq'].to(self.device)
         self.lq_rgb = tensor_lab2rgb(torch.cat([self.lq, torch.zeros_like(self.lq), torch.zeros_like(self.lq)], dim=1))
+        self.ref_lq_rgb = None
         if 'gt' in data:
             self.gt = data['gt'].to(self.device)
             self.gt_lab = torch.cat([self.lq, self.gt], dim=1)
@@ -316,6 +317,13 @@ class ColorModel(BaseModel):
             self.ref_rgb = data.get('ref_rgb', None)
             if self.ref_rgb is not None:
                 self.ref_rgb = self.ref_rgb.to(self.device)
+            ref_l = data.get('ref_l', None)
+            if ref_l is not None:
+                ref_l = ref_l.to(self.device)
+                # Match lq encoder input logic: L + zero ab -> pseudo RGB.
+                self.ref_lq_rgb = tensor_lab2rgb(
+                    torch.cat([ref_l, torch.zeros_like(ref_l), torch.zeros_like(ref_l)], dim=1)
+                )
             self.ref_path = data.get('ref_path', None)
 
             if self.opt['train'].get('color_enhance', False):
@@ -456,11 +464,12 @@ class ColorModel(BaseModel):
 
             # 从参考图提取条件特征（当前使用 pixel decoder 三尺度特征）并构建 cond tokens。
             # 随后对内容图执行主前向（net_g），把 cond tokens 注入 color decoder。
+            ref_for_encoder = self.ref_lq_rgb if self.ref_lq_rgb is not None else self.ref_rgb
             if freeze_ref_encoder:
                 with torch.no_grad():
-                    ref_feats = self.net_g.extract_condition_features(self.ref_rgb, use_pixel_decoder=True)
+                    ref_feats = self.net_g.extract_condition_features(ref_for_encoder, use_pixel_decoder=True)
             else:
-                ref_feats = self.net_g.extract_condition_features(self.ref_rgb, use_pixel_decoder=True)
+                ref_feats = self.net_g.extract_condition_features(ref_for_encoder, use_pixel_decoder=True)
 
             cond_tokens_per_scale, cond_pos_per_scale = self.net_c(ref_feats)
             if cond_gain != 1.0 and cond_tokens_per_scale is not None:
