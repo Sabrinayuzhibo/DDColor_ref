@@ -1,0 +1,115 @@
+模型命名解释（当前版本）
+
+一、输入相关命名
+1) lq
+- 含义：low-quality 输入。
+- 在本项目中：指 Lab 空间的 L 通道（灰度亮度）。
+
+2) lq_rgb
+- 含义：把 lq 转成 3 通道伪 RGB 后的张量。
+- 方式：先构造 [L, 0, 0] 的 Lab，再转成 RGB。
+- 用途：作为内容图主分支输入到 net_g / ConvNeXt。
+
+3) gt
+- 含义：ground truth 目标色彩（ab 通道）。
+
+4) gt_rgb
+- 含义：由 [lq, gt] 还原出的目标 RGB 图。
+
+5) ref_rgb
+- 含义：参考图的原始 RGB 输入。
+- 用途：
+	- 作为 ref 风格/颜色损失的对齐目标。
+	- 在启用 ref_rgb_convnext 时，直接送入独立参考编码器。
+
+6) ref_l
+- 含义：从 ref_rgb 提取的 Lab-L 通道。
+
+7) ref_lq_rgb
+- 含义：由 ref_l 构造出的伪 RGB（与 lq_rgb 同分布）。
+- 用途：当未启用独立 ref_rgb_convnext 时，作为参考特征提取输入。
+
+
+二、主干与条件分支命名
+1) net_g
+- 含义：主生成器（DDColor 主网络）。
+
+2) net_d
+- 含义：判别器（GAN 分支）。
+
+3) net_c
+- 含义：条件 token 生成器（conditioner）。
+- 当前常用：multiscale_flatten 模式。
+
+4) cond_tokens_per_scale
+- 含义：参考条件 token（按尺度或拼接形式）。
+- 用途：注入到 color decoder 的条件 cross-attn。
+
+5) cond_pos_per_scale
+- 含义：条件 token 的位置编码（若有）。
+
+
+三、独立参考编码器（你新增的核心）
+1) ref_rgb_convnext
+- 含义：独立的参考图编码器（timm 预训练 ConvNeXt）。
+- 目标：从 ref_rgb 中提取颜色+语义特征，不复用灰度主干路径。
+
+2) use_ref_rgb_convnext
+- 含义：是否启用独立参考编码器。
+
+3) ref_rgb_convnext_trainable
+- 含义：独立参考编码器当前是否可训练（是否参与反向更新）。
+
+4) ref_rgb_convnext_opt（配置组）
+- enable：是否启用 ref_rgb_convnext。
+- model_name：模型名，如 convnext_base / convnext_large。
+- pretrained：是否加载预训练权重。
+- out_indices：输出多尺度特征层索引。
+- freeze_ref_rgb_convnext：是否冻结参考编码器主干。
+- unfreeze_ref_rgb_convnext_last_stage：冻结主干时，是否额外解冻最后一个 stage。
+
+
+四、Color Query 初始化注入命名
+1) color_query_init_from_cond
+- 含义：是否启用“由参考条件 token 初始化 color query”。
+
+2) color_query_init_mode
+- residual：Q0 = Qlearned + lambda * seed（推荐，稳）。
+- replace：Q0 = lambda * seed（更激进）。
+
+3) color_query_init_gain
+- 含义：公式中的 lambda，控制注入强度。
+- 常用起点：0.5。
+
+4) color_query_init_pool
+- 含义：对 Tref 的池化方式。
+- mean：均值池化（默认，最稳）。
+- max：最大池化（更激进）。
+
+
+五、常见训练模式命名
+1) train_only_cond
+- 仅训练条件分支（通常 net_c）。
+
+2) train_decoder_cond
+- 冻结 encoder，只训练 decoder + conditioner。
+
+3) train_color_decoder_cond
+- 更细粒度：仅训练 color decoder（及相关门控）+ conditioner。
+
+
+六、你当前这版的核心逻辑（一句话）
+- 内容图走 lq_rgb 主干路径；
+- 参考图优先走 ref_rgb -> ref_rgb_convnext 提特征；
+- 特征经 net_c 形成条件 token；
+- 再通过 color_query_init_* 把参考信息注入 color queries。
+
+
+七、兼容旧命名说明
+- 为避免旧配置失效，代码里保留了部分旧键兼容读取：
+	- ref_rgb_encoder_opt -> ref_rgb_convnext_opt
+	- ref_convnext_opt -> ref_rgb_convnext_opt
+	- freeze_backbone -> freeze_ref_rgb_convnext
+	- freeze_ref_convnext -> freeze_ref_rgb_convnext
+	- unfreeze_last_stage -> unfreeze_ref_rgb_convnext_last_stage
+	- unfreeze_ref_convnext_last_stage -> unfreeze_ref_rgb_convnext_last_stage

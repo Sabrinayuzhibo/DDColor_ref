@@ -27,6 +27,10 @@ class DDColor(nn.Module):
                  dec_layers=9,
                  use_cond_gate=False,
                  cond_gate_init=0.0,
+                 color_query_init_from_cond=False,
+                 color_query_init_mode='residual',
+                 color_query_init_gain=0.5,
+                 color_query_init_pool='mean',
                  encoder_from_pretrain=False):
         super().__init__()
 
@@ -46,6 +50,10 @@ class DDColor(nn.Module):
             dec_layers=dec_layers,
             use_cond_gate=use_cond_gate,
             cond_gate_init=cond_gate_init,
+            color_query_init_from_cond=color_query_init_from_cond,
+            color_query_init_mode=color_query_init_mode,
+            color_query_init_gain=color_query_init_gain,
+            color_query_init_pool=color_query_init_pool,
             decoder_name=decoder_name
         )
         self.refine_net = nn.Sequential(custom_conv_layer(num_queries + 3, num_output_channels, ks=1, use_activ=False, norm_type=NormType.Spectral))
@@ -116,6 +124,10 @@ class Decoder(nn.Module):
                  dec_layers=9,
                  use_cond_gate=False,
                  cond_gate_init=0.0,
+                 color_query_init_from_cond=False,
+                 color_query_init_mode='residual',
+                 color_query_init_gain=0.5,
+                 color_query_init_pool='mean',
                  decoder_name='MultiScaleColorDecoder'):
         super().__init__()
         self.hooks = hooks
@@ -138,6 +150,10 @@ class Decoder(nn.Module):
                 dec_layers=dec_layers,
                 use_cond_gate=use_cond_gate,
                 cond_gate_init=cond_gate_init,
+                color_query_init_from_cond=color_query_init_from_cond,
+                color_query_init_mode=color_query_init_mode,
+                color_query_init_gain=color_query_init_gain,
+                color_query_init_pool=color_query_init_pool,
             )
         else:
             self.color_decoder = SingleColorDecoder(
@@ -272,6 +288,10 @@ class MultiScaleColorDecoder(nn.Module):
         num_scales=3,
         use_cond_gate=False,
         cond_gate_init=0.0,
+        color_query_init_from_cond=False,
+        color_query_init_mode='residual',
+        color_query_init_gain=0.5,
+        color_query_init_pool='mean',
     ):
         super().__init__()
 
@@ -346,6 +366,13 @@ class MultiScaleColorDecoder(nn.Module):
         self.num_feature_levels = num_scales
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
 
+        # Optional query initialization from reference condition tokens.
+        self.color_query_init_from_cond = bool(color_query_init_from_cond)
+        self.color_query_init_mode = str(color_query_init_mode).lower()
+        self.color_query_init_gain = float(color_query_init_gain)
+        self.color_query_init_pool = str(color_query_init_pool).lower()
+        self.query_init_proj = nn.Linear(hidden_dim, hidden_dim)
+
         # 条件 cross-attn 的可选 gate（按尺度设置，而非按层）
         # 理由：同一尺度的 cond token 应该使用相同的 gate，更符合语义
         self.use_cond_gate = use_cond_gate
@@ -373,6 +400,47 @@ class MultiScaleColorDecoder(nn.Module):
         # Debug flag: log cond branch statistics only once.
         self._cond_debug_logged = False
 
+    def _cond_tokens_to_bnc(self, cond_tokens_per_scale):
+        """Convert condition tokens to (B, N, C) for query init."""
+        if cond_tokens_per_scale is None:
+            return None
+
+        if isinstance(cond_tokens_per_scale, (list, tuple)):
+            bnc_list = []
+            for t in cond_tokens_per_scale:
+                if not torch.is_tensor(t) or t.dim() != 3:
+                    continue
+                # Multi-scale token list usually uses (N, B, C)
+                bnc_list.append(t.transpose(0, 1).contiguous())
+            if len(bnc_list) == 0:
+                return None
+            return torch.cat(bnc_list, dim=1)
+
+        if torch.is_tensor(cond_tokens_per_scale):
+            if cond_tokens_per_scale.dim() != 3:
+                raise ValueError(
+                    f'Expected cond tokens as 3D tensor, got shape={tuple(cond_tokens_per_scale.shape)}'
+                )
+            return cond_tokens_per_scale
+
+        raise TypeError('cond_tokens_per_scale must be list/tuple or tensor.')
+
+    def _build_query_seed_from_cond(self, cond_tokens_per_scale, bs, device, dtype):
+        cond_bnc = self._cond_tokens_to_bnc(cond_tokens_per_scale)
+        if cond_bnc is None:
+            return None
+        if cond_bnc.shape[0] != bs:
+            raise ValueError(f'Batch mismatch for cond tokens: got B={cond_bnc.shape[0]}, expected {bs}')
+
+        if self.color_query_init_pool == 'max':
+            pooled = cond_bnc.max(dim=1, keepdim=True).values
+        else:
+            pooled = cond_bnc.mean(dim=1, keepdim=True)
+
+        seed_b1c = self.query_init_proj(pooled)
+        seed_bqc = seed_b1c.repeat(1, self.num_queries, 1)
+        return seed_bqc.transpose(0, 1).contiguous().to(device=device, dtype=dtype)
+
     def forward(self, x, img_features, cond_tokens_per_scale=None, cond_pos_per_scale=None):
         # x 是多尺度特征列表
         assert len(x) == self.num_feature_levels
@@ -392,6 +460,20 @@ class MultiScaleColorDecoder(nn.Module):
         # Query 形状：QxNxC
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+
+        # Optional: initialize color queries from reference condition tokens.
+        if self.color_query_init_from_cond and cond_tokens_per_scale is not None:
+            cond_seed = self._build_query_seed_from_cond(
+                cond_tokens_per_scale,
+                bs=bs,
+                device=output.device,
+                dtype=output.dtype,
+            )
+            if cond_seed is not None:
+                if self.color_query_init_mode == 'replace':
+                    output = self.color_query_init_gain * cond_seed
+                else:
+                    output = output + self.color_query_init_gain * cond_seed
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels

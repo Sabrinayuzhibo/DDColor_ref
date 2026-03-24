@@ -1,3 +1,7 @@
+# GENERATE TIME: Mon Mar 23 19:04:33 2026
+# CMD:
+# D:\PythonProject2\DDcolor_local_run\DDColor_ref_local_run\basicsr\train.py -opt options/train/train_my_flatten_sine_stageAv2_40k.yml --launcher none
+
 #! condB grid + pos enc: 40k train, ddcolor_artistic backbone
 #! satgeAv2只用预训练模型来初始化backbone然后其他的全部都是随机初始化的
 
@@ -83,6 +87,11 @@ network_g:
   dec_layers: 9
   use_cond_gate: true
   cond_gate_init: 0.5
+  #这个就是用的ref_rgb走convnext出来的token的条件注入
+  color_query_init_from_cond: true
+  color_query_init_mode: residual
+  color_query_init_gain: 0.5
+  color_query_init_pool: mean
   last_norm: Spectral
   num_output_channels: 2
   do_normalize: False
@@ -117,7 +126,14 @@ train:
     use_scale_embed: true
     use_spatial_pos: true
     spatial_pos_type: sine
-    freeze_ref_encoder: true  # ✅ 冻结参考图特征提取过程，节省大量显存
+    freeze_ref_lq_ref_convnext: true  # ✅ 控制 DDColor 的 ConvNeXt(原图[l,0,0]/ref_lq_rgb 路径) 是否冻结
+    ref_rgb_convnext_opt:
+      enable: true
+      model_name: convnext_base
+      pretrained: true
+      out_indices: [1, 2, 3]
+      freeze_ref_rgb_convnext: true  # ✅ 仅控制独立 ref_rgb_convnext 参数是否可训练
+      unfreeze_ref_rgb_convnext_last_stage: false
 
   # 强监督阶段：关闭颜色增强，避免监督目标被二次偏移
   color_enhance: False
@@ -144,7 +160,7 @@ train:
 
   pixel_opt:
     type: L1Loss
-    loss_weight: 2.0
+    loss_weight: 0.1
     reduction: mean
 
   perceptual_opt:
@@ -158,7 +174,7 @@ train:
     vgg_type: vgg16_bn
     use_input_norm: true
     range_norm: false
-    perceptual_weight: 1.2
+    perceptual_weight: 1.0
     style_weight: 0
     criterion: l1
 
@@ -197,17 +213,17 @@ train:
     gan_type: vanilla
     real_label_val: 1.0
     fake_label_val: 0.0
-    loss_weight: 0.01
+    loss_weight: 0.8
 
   # ✅ 色彩先做轻约束，避免过度饱和
   colorfulness_opt:
     type: ColorfulnessLoss
-    loss_weight: 0.03
+    loss_weight: 0.05
 
   cond_gate_push_opt:
     enable: true
-    loss_weight: 0.03
-    target_sigmoid: 0.55
+    loss_weight: 0.3
+    target_sigmoid: 0.8
 
 val:
   val_freq: !!float 2000

@@ -2,6 +2,7 @@ import os
 import re
 import hashlib
 import torch
+import torch.nn as nn
 import itertools
 from collections import OrderedDict
 from os import path as osp
@@ -23,6 +24,11 @@ from basicsr.utils.dist_util import master_only
 from basicsr.utils.registry import MODEL_REGISTRY
 from .base_model import BaseModel
 from basicsr.utils.color_enhance import color_enhacne_blend
+
+try:
+    import timm
+except Exception:  # pragma: no cover
+    timm = None
 
 # 可选依赖：`custom_fid` 需要 SciPy。
 # 这里做成惰性/可选导入，保证在最小环境下（不计算 FID）也能正常训练。
@@ -60,6 +66,57 @@ def _safe_log_text(text) -> str:
     return str(text).encode('ascii', errors='backslashreplace').decode('ascii')
 
 
+class TimmRefConvNeXtEncoder(nn.Module):
+    """Independent reference ConvNeXt encoder built from timm features_only models."""
+
+    def __init__(self, model_name='convnext_base', pretrained=True, out_indices=(1, 2, 3)):
+        super().__init__()
+        if timm is None:
+            raise ImportError(
+                'timm is required for ref_rgb_convnext_opt.enable=true. '
+                'Please install it via `pip install timm`.'
+            )
+
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=bool(pretrained),
+            in_chans=3,
+            features_only=True,
+            out_indices=tuple(out_indices),
+        )
+        self.register_buffer('pixel_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer('pixel_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
+
+    def forward(self, ref_rgb: torch.Tensor):
+        x = (ref_rgb - self.pixel_mean.to(device=ref_rgb.device, dtype=ref_rgb.dtype)) / \
+            self.pixel_std.to(device=ref_rgb.device, dtype=ref_rgb.dtype)
+        feats = self.backbone(x)
+        return list(feats)
+
+    def set_trainable(self, freeze_ref_rgb_convnext: bool = True, unfreeze_ref_rgb_convnext_last_stage: bool = False):
+        for p in self.backbone.parameters():
+            p.requires_grad = not bool(freeze_ref_rgb_convnext)
+
+        if bool(freeze_ref_rgb_convnext) and bool(unfreeze_ref_rgb_convnext_last_stage):
+            last_stage = None
+            if hasattr(self.backbone, 'stages'):
+                stages = getattr(self.backbone, 'stages')
+                if len(stages) > 0:
+                    last_stage = stages[-1]
+            elif hasattr(self.backbone, 'layers'):
+                layers = getattr(self.backbone, 'layers')
+                if len(layers) > 0:
+                    last_stage = layers[-1]
+            else:
+                children = list(self.backbone.children())
+                if len(children) > 0:
+                    last_stage = children[-1]
+
+            if last_stage is not None:
+                for p in last_stage.parameters():
+                    p.requires_grad = True
+
+
 @MODEL_REGISTRY.register()
 class ColorModel(BaseModel):
     """Colorization model for single image colorization."""
@@ -91,8 +148,17 @@ class ColorModel(BaseModel):
         # 可选参考条件分支 net_c（DDColor cond-B）
         self.cond_enable = bool(self.opt.get('train', {}).get('cond_opt', {}).get('enable', False)) if self.opt.get('is_train', False) else False
         self.net_c = None
+        self.ref_rgb_convnext = None
+        self.use_ref_rgb_convnext = False
+        self.ref_rgb_convnext_trainable = False
+        self.freeze_ref_lq_ref_convnext = False
+        self.freeze_ref_rgb_convnext = True
         if self.cond_enable:
             cond_opt = self.opt.get('train', {}).get('cond_opt', {})
+            freeze_ref_encoder_legacy = bool(cond_opt.get('freeze_ref_encoder', False))
+            self.freeze_ref_lq_ref_convnext = bool(
+                cond_opt.get('freeze_ref_lq_ref_convnext', freeze_ref_encoder_legacy)
+            )
             token_mode = str(cond_opt.get('token_mode', 'dense')).lower()
             num_scales = int(cond_opt.get('num_scales', 3))
             hidden_dim = int(cond_opt.get('hidden_dim', 256))
@@ -123,6 +189,45 @@ class ColorModel(BaseModel):
             self.net_c = self.model_to_device(self.net_c)
             self.print_network(self.net_c)
 
+            # Optional independent RGB reference encoder for color-aware ref features.
+            ref_rgb_enc_opt = cond_opt.get(
+                'ref_rgb_convnext_opt',
+                cond_opt.get('ref_convnext_opt', cond_opt.get('ref_rgb_encoder_opt', {}))
+            )
+            if bool(ref_rgb_enc_opt.get('enable', False)):
+                model_name = str(ref_rgb_enc_opt.get('model_name', 'convnext_base'))
+                pretrained = bool(ref_rgb_enc_opt.get('pretrained', True))
+                out_indices = tuple(ref_rgb_enc_opt.get('out_indices', [1, 2, 3]))
+                freeze_ref_rgb_convnext = bool(
+                    ref_rgb_enc_opt.get(
+                        'freeze_ref_rgb_convnext',
+                        ref_rgb_enc_opt.get('freeze_ref_convnext', ref_rgb_enc_opt.get('freeze_backbone', True))
+                    )
+                )
+                self.freeze_ref_rgb_convnext = freeze_ref_rgb_convnext
+                unfreeze_ref_rgb_convnext_last_stage = bool(
+                    ref_rgb_enc_opt.get(
+                        'unfreeze_ref_rgb_convnext_last_stage',
+                        ref_rgb_enc_opt.get('unfreeze_ref_convnext_last_stage', ref_rgb_enc_opt.get('unfreeze_last_stage', False))
+                    )
+                )
+
+                self.ref_rgb_convnext = TimmRefConvNeXtEncoder(
+                    model_name=model_name,
+                    pretrained=pretrained,
+                    out_indices=out_indices,
+                )
+                self.ref_rgb_convnext = self.model_to_device(self.ref_rgb_convnext)
+                self.ref_rgb_convnext.set_trainable(
+                    freeze_ref_rgb_convnext=freeze_ref_rgb_convnext,
+                    unfreeze_ref_rgb_convnext_last_stage=unfreeze_ref_rgb_convnext_last_stage,
+                )
+                self.ref_rgb_convnext_trainable = any(
+                    p.requires_grad for p in self.ref_rgb_convnext.parameters()
+                )
+                self.use_ref_rgb_convnext = True
+                self.print_network(self.ref_rgb_convnext)
+
         # 如果只想训练 conditioner，则先冻结 net_g 参数
         if self.is_train and self.train_only_cond:
             for p in self.net_g.parameters():
@@ -145,6 +250,14 @@ class ColorModel(BaseModel):
                 raise ValueError('train_color_decoder_cond=True 但 net_g.decoder.color_decoder 不存在。')
             for p in color_dec.parameters():
                 p.requires_grad = True
+
+        # 独立控制 DDColor 主干 encoder(ConvNeXt) 的冻结状态，
+        # 该分支同时影响 lq 与 ref_lq_rgb 走 extract_condition_features 的参数可训练性。
+        if self.is_train and self.cond_enable and (not self.train_only_cond):
+            enc = getattr(self.net_g, 'encoder', None)
+            if enc is not None:
+                for p in enc.parameters():
+                    p.requires_grad = not bool(self.freeze_ref_lq_ref_convnext)
         
         # 加载 net_g 预训练权重
         load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -195,6 +308,11 @@ class ColorModel(BaseModel):
         self.net_d.train()
         if self.cond_enable and self.net_c is not None:
             self.net_c.train()
+        if self.use_ref_rgb_convnext and self.ref_rgb_convnext is not None:
+            if self.ref_rgb_convnext_trainable:
+                self.ref_rgb_convnext.train()
+            else:
+                self.ref_rgb_convnext.eval()
 
         # 构建各类损失
         if train_opt.get('pixel_opt'):
@@ -280,6 +398,8 @@ class ColorModel(BaseModel):
             modules = [self.net_c]
         elif self.cond_enable and self.net_c is not None:
             modules = [self.net_g, self.net_c]
+            if self.use_ref_rgb_convnext and self.ref_rgb_convnext is not None and self.ref_rgb_convnext_trainable:
+                modules.append(self.ref_rgb_convnext)
         else:
             modules = [self.net_g]
 
@@ -457,19 +577,30 @@ class ColorModel(BaseModel):
         cond_pos_per_scale = None
         if self.cond_enable and self.net_c is not None and getattr(self, 'ref_rgb', None) is not None:
             cond_opt = self.opt['train'].get('cond_opt', {})
-            # 历史命名沿用 freeze_ref_encoder；当前语义是：
-            # 参考分支特征提取（extract_condition_features）是否在 no_grad 下执行。
-            freeze_ref_encoder = bool(cond_opt.get('freeze_ref_encoder', False))
+            # 新语义：
+            # freeze_ref_rgb_convnext 仅控制独立 ref_rgb_convnext 分支参数可训练性；
+            # freeze_ref_lq_ref_convnext 控制 DDColor encoder(ConvNeXt) 在 ref_lq_rgb 路径中的 no_grad/参数冻结。
+            freeze_ref_lq_ref_convnext = bool(
+                cond_opt.get('freeze_ref_lq_ref_convnext', cond_opt.get('freeze_ref_encoder', self.freeze_ref_lq_ref_convnext))
+            )
             cond_gain = float(cond_opt.get('gain', 1.0))
 
             # 从参考图提取条件特征（当前使用 pixel decoder 三尺度特征）并构建 cond tokens。
             # 随后对内容图执行主前向（net_g），把 cond tokens 注入 color decoder。
-            ref_for_encoder = self.ref_lq_rgb if self.ref_lq_rgb is not None else self.ref_rgb
-            if freeze_ref_encoder:
-                with torch.no_grad():
-                    ref_feats = self.net_g.extract_condition_features(ref_for_encoder, use_pixel_decoder=True)
+            if self.use_ref_rgb_convnext and self.ref_rgb_convnext is not None:
+                # Independent ref RGB encoder branch (color-aware).
+                if self.freeze_ref_rgb_convnext or (not self.ref_rgb_convnext_trainable):
+                    with torch.no_grad():
+                        ref_feats = self.ref_rgb_convnext(self.ref_rgb)
+                else:
+                    ref_feats = self.ref_rgb_convnext(self.ref_rgb)
             else:
-                ref_feats = self.net_g.extract_condition_features(ref_for_encoder, use_pixel_decoder=True)
+                ref_for_encoder = self.ref_lq_rgb if self.ref_lq_rgb is not None else self.ref_rgb
+                if freeze_ref_lq_ref_convnext:
+                    with torch.no_grad():
+                        ref_feats = self.net_g.extract_condition_features(ref_for_encoder, use_pixel_decoder=True)
+                else:
+                    ref_feats = self.net_g.extract_condition_features(ref_for_encoder, use_pixel_decoder=True)
 
             cond_tokens_per_scale, cond_pos_per_scale = self.net_c(ref_feats)
             if cond_gain != 1.0 and cond_tokens_per_scale is not None:
