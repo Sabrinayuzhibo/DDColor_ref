@@ -187,3 +187,4 @@ Transformer decoder 的 9 个 block（每层包含 self-attn / image cross-attn 
 - 训练/推理两边的 cond 特征来源已统一。
 - 若想进一步增强“参考感”，优先调：`cond_gain`、`cond_gate_push_opt`、`ref_style/ref_moment/ref_cov/ref_contrast`。
 
+adadada
